@@ -1,0 +1,10 @@
+# Python tooling only -- the engine itself has zero runtime dependencies.
+# These power weight export and the reference-diffing verification harness.
+
+numpy>=1.24
+torch>=2.0
+transformers>=4.30
+
+# For the Llama port (weeks 9-10), uncomment the tokenizer you need:
+# sentencepiece>=0.1.99   # TinyLlama 1.1B (.model tokenizer)
+# tiktoken>=0.5           # Llama 3.2 1B (tiktoken-style BPE)

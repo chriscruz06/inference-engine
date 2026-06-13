@@ -1,0 +1,27 @@
+# Build output
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+
+# Model weights & activation dumps (large; regenerate with tools/)
+models/*
+!models/.gitkeep
+tests/reference_dumps/
+tests/engine_dumps/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
