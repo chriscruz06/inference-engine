@@ -93,4 +93,12 @@ if(IE_BUILD_TESTS)
     add_executable(test_gemm tests/test_gemm.cpp)
     target_link_libraries(test_gemm PRIVATE ie_core)
     add_test(NAME gemm_correctness COMMAND test_gemm)
+
+    # Loader + tokenizer-decode round trip. Runs self-contained (hermetic): it
+    # writes tiny fixtures itself, so no Python/numpy is needed at test time.
+    # For the cross-language check, run tests/make_fixtures.py and then
+    # `test_loader --fixture <dir>` (see README).
+    add_executable(test_loader tests/test_loader.cpp)
+    target_link_libraries(test_loader PRIVATE ie_core)
+    add_test(NAME loader_roundtrip COMMAND test_loader)
 endif()
