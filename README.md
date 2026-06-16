@@ -1,25 +1,25 @@
 # inference-engine
 
-[![CI](https://github.com/chriscruz06/inference-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/chriscruz06/inference-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/OWNER/inference-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/inference-engine/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 
 A from-scratch LLM inference engine in C++. It loads a real model's weights,
 runs the entire transformer forward pass by hand, and is optimized to compete
-with [`llama.cpp`](https://github.com/ggerganov/llama.cpp) on CPU; **no PyTorch,
+with [`llama.cpp`](https://github.com/ggerganov/llama.cpp) on CPU: **no PyTorch,
 no BLAS, no ML or math frameworks**. The standard library and OpenMP are the only
 things linked.
 
 > **Status: scaffolding.** The build, CI, and project skeleton are in place and
-> green. The engine internals are being filled in phase by phase, see the
-> [roadmap](#roadmap). Today the CLI loads its config and the naive GEMM kernel
-> is tested; the forward pass lands next.
+> green. The engine internals are being filled in phase by phase. See the
+> [roadmap](#roadmap). Today the weight loader and the byte-level tokenizer
+> `decode` work, the naive GEMM kernel is tested, and the forward pass is next.
 
 ## Why
 
 Single-token LLM generation is, under the hood, a fixed sequence of matrix
-multiplications plus a handful of other operations. Writing that out by hand
-and then making it fast sits at the intersection of low-level systems work and
+multiplications plus a handful of other operations. Writing that out by hand,
+and then making it fast, sits at the intersection of low-level systems work and
 machine learning. This project is that exercise end to end: correctness first,
 then the performance work (SIMD, cache blocking, multithreading, quantization)
 that actually earns a benchmark.
@@ -43,14 +43,14 @@ treats them differently:
 | Prefill   | matrix × matrix  | compute (FLOPs)    | tiling / cache blocking, SIMD |
 | Decode    | matrix × vector  | memory bandwidth   | SIMD, quantization (fewer bytes/token) |
 
-A [KV cache](https://github.com/chriscruz06/inference-engine) stores the keys and
+A [KV cache](https://github.com/OWNER/inference-engine) stores the keys and
 values from previous tokens so decode only computes the new token's worth of
 work, instead of recomputing the whole sequence every step.
 
 ## Verification (the actual hard part)
 
-The tricky bugs here aren't crashes per say, they're a single transposed matrix or an
-off-by-one in the attention mask that makes the output almost right. So the
+The tricky bugs here aren't crashes; they're a single transposed matrix or an
+off-by-one in the attention mask that makes the output *almost* right. So the
 project is built around a reference-diffing harness:
 
 1. `tools/reference.py` runs the HuggingFace reference model on one frozen prompt
@@ -106,10 +106,10 @@ python tools/export_weights.py --model gpt2 --out models/gpt2-124m.bin
 ## Roadmap
 
 - [x] Repo scaffolding, CMake build, CI, naive GEMM + test
-- [ ] **Phase 1**: Weight export + BPE tokenizer (`decode` first)
+- [x] **Phase 1**: Weight export + BPE tokenizer (`decode` first)
 - [ ] **Phase 2**: Full forward pass, naive matmul, coherent GPT-2 text (verified against reference)
 - [ ] **Phase 3**: KV cache (the unusable → usable jump)
-- [ ] **Phase 4**: GEMM optimization: AVX2, multithreading, cache tiling
+- [ ] **Phase 4**: GEMM optimization (AVX2, multithreading, cache tiling)
 - [ ] **Phase 5**: int8, then int4 quantization
 - [ ] **Phase 6**: Port to a ~1B Llama (RoPE, SwiGLU, GQA, RMSNorm) + benchmark vs `llama.cpp`
 
@@ -121,11 +121,11 @@ hides the story), on the same model, machine, quantization, and thread count as
 
 | Model | Regime  | engine (tok/s) | llama.cpp (tok/s) | ratio |
 |-------|---------|---------------:|------------------:|------:|
-| TBD   | prefill | _              | _                 | _     |
-| TBD   | decode  | _              | _                 | _     |
+| TBD   | prefill | TBD            | TBD               | TBD   |
+| TBD   | decode  | TBD            | TBD               | TBD   |
 
 **Honest target:** `llama.cpp` is years of hand-tuned kernels. A from-scratch
-CPU engine landing within **2–4×** of its tokens/sec on the same hardware is a
+CPU engine landing within **2-4×** of its tokens/sec on the same hardware is a
 strong result; "same order of magnitude" is the win. The writeup will focus on
 *the gap and what would close it*, which is more interesting than a single
 number.
@@ -153,12 +153,12 @@ inference-engine/
 
 ## References
 
-- Andrej Karpathy's [`llm.c`](https://github.com/karpathy/llm.c), a clean
+- Andrej Karpathy's [`llm.c`](https://github.com/karpathy/llm.c): a clean
   reference implementation of exactly this idea.
-- [`llama.cpp`](https://github.com/ggerganov/llama.cpp), the benchmark, and a
+- [`llama.cpp`](https://github.com/ggerganov/llama.cpp): the benchmark, and a
   goldmine of CPU kernel tricks.
 - The original GPT-2 and Llama papers for the architecture details.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
