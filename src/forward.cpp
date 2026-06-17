@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -103,11 +104,15 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
     const ModelConfig& c = model.config;
     const int seq = static_cast<int>(tokens.size());
     const int d = c.d_model;
+    const int dm = c.d_mlp;
+    const int V = c.vocab_size;
     const char* dump_dir = std::getenv("IE_DUMP_DIR");
+    std::string dir;
+    if (dump_dir) dir = dump_dir;
 
-    // Residual stream, [seq, d]. Embedding: wte[token] + wpe[pos] (no scale in GPT-2).
+    // ---- Embedding: wte[token] + wpe[pos] (no scale in GPT-2). ----
     std::vector<float> x(static_cast<std::size_t>(seq) * static_cast<std::size_t>(d));
-    const float* wte = model.at(model.w.wte);
+    const float* wte = model.at(model.w.wte);  // [vocab, d]; reused as the tied LM head below
     const float* wpe = model.at(model.w.wpe);
     for (int t = 0; t < seq; ++t) {
         const float* tok_row = wte + static_cast<std::size_t>(tokens[t]) * d;
@@ -115,34 +120,71 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
         float* dst = x.data() + static_cast<std::size_t>(t) * d;
         for (int j = 0; j < d; ++j) dst[j] = tok_row[j] + pos_row[j];
     }
-    if (dump_dir) npy::save_2d(std::string(dump_dir) + "/00_embed.npy", x, seq, d);
+    if (dump_dir) npy::save_2d(dir + "/00_embed.npy", x, seq, d);
 
-    // --- TEMPORARY bringup scaffold ---------------------------------------
-    // Dump layer 0's ln_1 and attn so each can be diffed in isolation before
-    // the MLP and the full block loop exist. Once the per-layer loop below is
-    // written, these dumps move inside it and this whole block is deleted.
-    if (dump_dir) {
-        const std::string dir(dump_dir);
-        const LayerWeights& L0 = model.w.layers[0];
+    // ---- Per-layer temporaries: allocated once, overwritten each layer. ----
+    std::vector<float> ln(x.size());                              // ln_1 / ln_2 output, [seq, d]
+    std::vector<float> attn(x.size());                            // attention output, [seq, d]
+    std::vector<float> mlp_h(static_cast<std::size_t>(seq) * dm); // MLP hidden, [seq, d_mlp]
+    std::vector<float> mlp(x.size());                             // MLP output, [seq, d]
 
-        std::vector<float> ln1(x.size());
+    // ---- Transformer blocks. x is the residual stream, carried across layers.
+    // Pre-LN GPT-2 block:  x += attn(ln_1(x));  x += mlp(ln_2(x)).
+    // Dumps are gated on IE_DUMP_DIR; the computation always runs. ----
+    for (int l = 0; l < c.n_layers; ++l) {
+        const LayerWeights& L = model.w.layers[static_cast<std::size_t>(l)];
+        char tag[16];
+        std::snprintf(tag, sizeof(tag), "%02d_L%02d", l + 1, l);  // "01_L00" .. "12_L11"
+
+        // ln_1 -> attention -> residual 1.
         for (int t = 0; t < seq; ++t)
-            layernorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L0.ln_1_w),
-                      model.at(L0.ln_1_b), ln1.data() + static_cast<std::size_t>(t) * d, d,
+            layernorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L.ln_1_w),
+                      model.at(L.ln_1_b), ln.data() + static_cast<std::size_t>(t) * d, d,
                       c.ln_eps);
-        npy::save_2d(dir + "/01_L00.ln_1.npy", ln1, seq, d);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".ln_1.npy", ln, seq, d);
 
-        std::vector<float> attn(x.size());
-        attention(ln1.data(), model.at(L0.c_attn_w), model.at(L0.c_attn_b), model.at(L0.c_proj_w),
-                  model.at(L0.c_proj_b), attn.data(), seq, d, c.n_heads);
-        npy::save_2d(dir + "/01_L00.attn.npy", attn, seq, d);
+        attention(ln.data(), model.at(L.c_attn_w), model.at(L.c_attn_b), model.at(L.c_proj_w),
+                  model.at(L.c_proj_b), attn.data(), seq, d, c.n_heads);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".attn.npy", attn, seq, d);
+
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += attn[i];
+
+        // ln_2 -> MLP -> residual 2.
+        for (int t = 0; t < seq; ++t)
+            layernorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L.ln_2_w),
+                      model.at(L.ln_2_b), ln.data() + static_cast<std::size_t>(t) * d, d,
+                      c.ln_eps);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".ln_2.npy", ln, seq, d);
+
+        linear(ln.data(), model.at(L.mlp_fc_w), model.at(L.mlp_fc_b), mlp_h.data(), seq, d, dm);
+        gelu_tanh(mlp_h.data(), static_cast<int>(mlp_h.size()));
+        linear(mlp_h.data(), model.at(L.mlp_proj_w), model.at(L.mlp_proj_b), mlp.data(), seq, dm,
+               d);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".mlp.npy", mlp, seq, d);
+
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += mlp[i];
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".block.npy", x, seq, d);
     }
-    // ----------------------------------------------------------------------
 
-    // TODO (next): residual add, then ln_2 -> mlp -> residual for the full
-    // block; loop x n_layers; final ln_f -> tied LM head -> logits.
-    // Returns last-position logits once that lands; zero placeholder for now.
-    return std::vector<float>(static_cast<std::size_t>(c.vocab_size), 0.0f);
+    // ---- Final LayerNorm. ----
+    std::vector<float> lnf(x.size());
+    for (int t = 0; t < seq; ++t)
+        layernorm(x.data() + static_cast<std::size_t>(t) * d, model.at(model.w.ln_f_w),
+                  model.at(model.w.ln_f_b), lnf.data() + static_cast<std::size_t>(t) * d, d,
+                  c.ln_eps);
+    if (dump_dir) npy::save_2d(dir + "/zz_ln_f.npy", lnf, seq, d);
+
+    // ---- Tied LM head: logits = lnf @ wte^T. wte is [vocab, d] = [out, in], so
+    // it drops straight into linear() as the weight. The head has no bias of its
+    // own; feed a zero vector so this is correct whether or not linear() guards a
+    // null bias pointer. (If yours does, you can pass nullptr and drop no_bias.)
+    std::vector<float> logits(static_cast<std::size_t>(seq) * static_cast<std::size_t>(V));
+    std::vector<float> no_bias(static_cast<std::size_t>(V), 0.0f);
+    linear(lnf.data(), wte, no_bias.data(), logits.data(), seq, d, V);
+    if (dump_dir) npy::save_2d(dir + "/zz_logits.npy", logits, seq, V);
+
+    // Last-position logits drive greedy decoding.
+    return std::vector<float>(logits.end() - V, logits.end());
 }
 
 }  // namespace ie
