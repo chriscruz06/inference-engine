@@ -1,6 +1,6 @@
 # inference-engine
 
-[![CI](https://github.com/OWNER/inference-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/inference-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/chriscruz06/inference-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/chriscruz06/inference-engine/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 
