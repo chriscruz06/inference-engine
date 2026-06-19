@@ -141,8 +141,7 @@ int main(int argc, char** argv) {
     // positions) and must stay a single forward so the dumps line up with the
     // fixed reference prompt.
     if (const char* dump_dir = std::getenv("IE_DUMP_DIR")) {
-        std::printf("[verify] %zu prompt tokens from '%s'\n", ids.size(),
-                    input_ids_path.c_str());
+        std::printf("[verify] %zu prompt tokens from '%s'\n", ids.size(), input_ids_path.c_str());
         const std::vector<float> logits = ie::forward(model, ids);
         (void)logits;
         std::printf("[verify] forward pass complete; activations dumped to '%s'\n", dump_dir);
@@ -197,8 +196,7 @@ int main(int argc, char** argv) {
             std::printf("[check-cache] PASS: all %d generated tokens identical.\n", budget);
             return 0;
         }
-        std::fprintf(stderr,
-                     "[check-cache] FAIL at generated token %d: uncached %d vs cached %d\n",
+        std::fprintf(stderr, "[check-cache] FAIL at generated token %d: uncached %d vs cached %d\n",
                      first_div, a[static_cast<std::size_t>(prompt_n + first_div)],
                      b[static_cast<std::size_t>(prompt_n + first_div)]);
         return 1;

@@ -13,7 +13,9 @@ bool read_exact(std::ifstream& in, void* dst, std::size_t bytes) {
     return static_cast<std::size_t>(in.gcount()) == bytes;
 }
 
-bool read_i32(std::ifstream& in, int32_t& v) { return read_exact(in, &v, sizeof(v)); }
+bool read_i32(std::ifstream& in, int32_t& v) {
+    return read_exact(in, &v, sizeof(v));
+}
 
 // Read an int32 length followed by that many raw bytes into `out`.
 bool read_string(std::ifstream& in, std::string& out) {

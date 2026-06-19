@@ -17,8 +17,8 @@ void matmul_naive(const float* A, const float* B, float* C, int M, int N, int K)
     }
 }
 
-void linear(const float* x, const float* w, const float* bias, float* y,
-            int rows, int in_dim, int out_dim) {
+void linear(const float* x, const float* w, const float* bias, float* y, int rows, int in_dim,
+            int out_dim) {
     for (int m = 0; m < rows; ++m) {
         const float* xr = x + static_cast<std::size_t>(m) * in_dim;
         float* yr = y + static_cast<std::size_t>(m) * out_dim;

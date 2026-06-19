@@ -41,8 +41,8 @@ struct KVCache {
         n_ctx = c.n_ctx;
         d = c.d_model;
         len = 0;
-        const std::size_t n = static_cast<std::size_t>(n_layers) *
-                              static_cast<std::size_t>(n_ctx) * static_cast<std::size_t>(d);
+        const std::size_t n = static_cast<std::size_t>(n_layers) * static_cast<std::size_t>(n_ctx) *
+                              static_cast<std::size_t>(d);
         k.assign(n, 0.0f);
         v.assign(n, 0.0f);
     }

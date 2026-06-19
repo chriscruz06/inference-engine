@@ -36,8 +36,12 @@ void check(bool ok, const char* what) {
     }
 }
 
-void put_i32(std::ofstream& f, std::int32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); }
-void put_f32(std::ofstream& f, float v) { f.write(reinterpret_cast<const char*>(&v), 4); }
+void put_i32(std::ofstream& f, std::int32_t v) {
+    f.write(reinterpret_cast<const char*>(&v), 4);
+}
+void put_f32(std::ofstream& f, float v) {
+    f.write(reinterpret_cast<const char*>(&v), 4);
+}
 
 // Small, deterministic, finite weights -- enough to drive a real forward pass
 // without overflowing (value==index, as in test_loader, would blow the matmuls

@@ -19,15 +19,14 @@ static const unsigned char MAGIC[6] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
 
 // Write `data` (rows*cols floats, row-major) as a 2-D float32 .npy.
 // Returns false on shape mismatch or I/O error (message on stderr).
-inline bool save_2d(const std::string& path, const std::vector<float>& data,
-                    int rows, int cols) {
+inline bool save_2d(const std::string& path, const std::vector<float>& data, int rows, int cols) {
     if (static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols) != data.size()) {
-        std::fprintf(stderr, "npy::save_2d: %s shape %dx%d != %zu elems\n",
-                     path.c_str(), rows, cols, data.size());
+        std::fprintf(stderr, "npy::save_2d: %s shape %dx%d != %zu elems\n", path.c_str(), rows,
+                     cols, data.size());
         return false;
     }
-    std::string hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
-                      std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+    std::string hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + std::to_string(rows) +
+                      ", " + std::to_string(cols) + "), }";
     // magic(6) + version(2) + hlen(2) + header must be a multiple of 64; header ends in '\n'.
     const std::size_t total = 10 + hdr.size() + 1;
     const std::size_t pad = (64 - (total % 64)) % 64;
@@ -35,20 +34,20 @@ inline bool save_2d(const std::string& path, const std::vector<float>& data,
     hdr.push_back('\n');
 
     std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) { std::perror(("npy::save_2d: " + path).c_str()); return false; }
+    if (!f) {
+        std::perror(("npy::save_2d: " + path).c_str());
+        return false;
+    }
 
     const unsigned char version[2] = {0x01, 0x00};
     const std::uint16_t hlen = static_cast<std::uint16_t>(hdr.size());
-    const unsigned char hlen_le[2] = {
-        static_cast<unsigned char>(hlen & 0xFF),
-        static_cast<unsigned char>((hlen >> 8) & 0xFF)};
+    const unsigned char hlen_le[2] = {static_cast<unsigned char>(hlen & 0xFF),
+                                      static_cast<unsigned char>((hlen >> 8) & 0xFF)};
 
-    const bool ok =
-        std::fwrite(MAGIC, 1, 6, f) == 6 &&
-        std::fwrite(version, 1, 2, f) == 2 &&
-        std::fwrite(hlen_le, 1, 2, f) == 2 &&
-        std::fwrite(hdr.data(), 1, hdr.size(), f) == hdr.size() &&
-        std::fwrite(data.data(), sizeof(float), data.size(), f) == data.size();
+    const bool ok = std::fwrite(MAGIC, 1, 6, f) == 6 && std::fwrite(version, 1, 2, f) == 2 &&
+                    std::fwrite(hlen_le, 1, 2, f) == 2 &&
+                    std::fwrite(hdr.data(), 1, hdr.size(), f) == hdr.size() &&
+                    std::fwrite(data.data(), sizeof(float), data.size(), f) == data.size();
     std::fclose(f);
     if (!ok) std::fprintf(stderr, "npy::save_2d: short write to %s\n", path.c_str());
     return ok;
@@ -59,7 +58,10 @@ inline bool save_2d(const std::string& path, const std::vector<float>& data,
 inline std::vector<int> load_i32_1d(const std::string& path) {
     std::vector<int> out;
     std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) { std::perror(("npy::load_i32_1d: " + path).c_str()); return out; }
+    if (!f) {
+        std::perror(("npy::load_i32_1d: " + path).c_str());
+        return out;
+    }
 
     unsigned char head[8];
     if (std::fread(head, 1, 8, f) != 8 || std::memcmp(head, MAGIC, 6) != 0) {
@@ -71,21 +73,30 @@ inline std::vector<int> load_i32_1d(const std::string& path) {
     std::size_t hlen = 0;
     if (head[6] >= 2) {  // version 2.0+: 4-byte header length
         unsigned char b[4];
-        if (std::fread(b, 1, 4, f) != 4) { std::fclose(f); return out; }
+        if (std::fread(b, 1, 4, f) != 4) {
+            std::fclose(f);
+            return out;
+        }
         hlen = static_cast<std::size_t>(b[0]) | (static_cast<std::size_t>(b[1]) << 8) |
                (static_cast<std::size_t>(b[2]) << 16) | (static_cast<std::size_t>(b[3]) << 24);
-    } else {             // version 1.0: 2-byte header length
+    } else {  // version 1.0: 2-byte header length
         unsigned char b[2];
-        if (std::fread(b, 1, 2, f) != 2) { std::fclose(f); return out; }
+        if (std::fread(b, 1, 2, f) != 2) {
+            std::fclose(f);
+            return out;
+        }
         hlen = static_cast<std::size_t>(b[0]) | (static_cast<std::size_t>(b[1]) << 8);
     }
 
     std::string hdr(hlen, '\0');
-    if (std::fread(&hdr[0], 1, hlen, f) != hlen) { std::fclose(f); return out; }
+    if (std::fread(&hdr[0], 1, hlen, f) != hlen) {
+        std::fclose(f);
+        return out;
+    }
 
     if (hdr.find("i4") == std::string::npos) {
-        std::fprintf(stderr, "npy::load_i32_1d: %s is not int32 (header: %s)\n",
-                     path.c_str(), hdr.c_str());
+        std::fprintf(stderr, "npy::load_i32_1d: %s is not int32 (header: %s)\n", path.c_str(),
+                     hdr.c_str());
         std::fclose(f);
         return out;
     }
@@ -112,8 +123,8 @@ inline std::vector<int> load_i32_1d(const std::string& path) {
     static_assert(sizeof(int) == 4, "load_i32_1d assumes 32-bit int");
     out.resize(count);
     if (std::fread(out.data(), sizeof(int), count, f) != count) {
-        std::fprintf(stderr, "npy::load_i32_1d: short read of %zu ints from %s\n",
-                     count, path.c_str());
+        std::fprintf(stderr, "npy::load_i32_1d: short read of %zu ints from %s\n", count,
+                     path.c_str());
         out.clear();
     }
     std::fclose(f);

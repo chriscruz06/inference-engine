@@ -15,8 +15,12 @@ bool read_exact(std::ifstream& in, void* dst, std::size_t bytes) {
     return static_cast<std::size_t>(in.gcount()) == bytes;
 }
 
-bool read_i32(std::ifstream& in, int32_t& v) { return read_exact(in, &v, sizeof(v)); }
-bool read_f32(std::ifstream& in, float& v) { return read_exact(in, &v, sizeof(v)); }
+bool read_i32(std::ifstream& in, int32_t& v) {
+    return read_exact(in, &v, sizeof(v));
+}
+bool read_f32(std::ifstream& in, float& v) {
+    return read_exact(in, &v, sizeof(v));
+}
 
 bool fail(const char* msg) {
     std::fprintf(stderr, "[model] %s\n", msg);

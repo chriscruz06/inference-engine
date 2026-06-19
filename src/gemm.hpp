@@ -25,8 +25,8 @@ void matmul_naive(const float* A, const float* B, float* C, int M, int N, int K)
 // inner loop walks x and one weight row, both contiguously -- which is exactly
 // the access pattern the AVX2 kernel will vectorize. The optimization phase
 // swaps this body and every call site (all the projections) is unchanged.
-void linear(const float* x, const float* w, const float* bias, float* y,
-            int rows, int in_dim, int out_dim);
+void linear(const float* x, const float* w, const float* bias, float* y, int rows, int in_dim,
+            int out_dim);
 
 // TODO (weeks 5-6), each verified token-identical against matmul_naive:
 //   void matmul_avx2(...);      // 8-wide FMA inner loop

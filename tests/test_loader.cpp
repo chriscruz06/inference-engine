@@ -36,8 +36,12 @@ void check(bool ok, const char* what) {
     }
 }
 
-void put_i32(std::ofstream& f, int32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); }
-void put_f32(std::ofstream& f, float v) { f.write(reinterpret_cast<const char*>(&v), 4); }
+void put_i32(std::ofstream& f, int32_t v) {
+    f.write(reinterpret_cast<const char*>(&v), 4);
+}
+void put_f32(std::ofstream& f, float v) {
+    f.write(reinterpret_cast<const char*>(&v), 4);
+}
 void put_str(std::ofstream& f, const std::string& s) {
     put_i32(f, static_cast<int32_t>(s.size()));
     f.write(s.data(), static_cast<std::streamsize>(s.size()));

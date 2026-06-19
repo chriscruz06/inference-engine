@@ -182,10 +182,10 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
     if (dump_dir) npy::save_2d(dir + "/00_embed.npy", x, seq, d);
 
     // ---- Per-layer temporaries: allocated once, overwritten each layer. ----
-    std::vector<float> ln(x.size());                              // ln_1 / ln_2 output, [seq, d]
-    std::vector<float> attn(x.size());                            // attention output, [seq, d]
-    std::vector<float> mlp_h(static_cast<std::size_t>(seq) * dm); // MLP hidden, [seq, d_mlp]
-    std::vector<float> mlp(x.size());                             // MLP output, [seq, d]
+    std::vector<float> ln(x.size());                               // ln_1 / ln_2 output, [seq, d]
+    std::vector<float> attn(x.size());                             // attention output, [seq, d]
+    std::vector<float> mlp_h(static_cast<std::size_t>(seq) * dm);  // MLP hidden, [seq, d_mlp]
+    std::vector<float> mlp(x.size());                              // MLP output, [seq, d]
 
     // ---- Transformer blocks. x is the residual stream, carried across layers.
     // Pre-LN GPT-2 block:  x += attn(ln_1(x));  x += mlp(ln_2(x)).
@@ -198,8 +198,7 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
         // ln_1 -> attention -> residual 1.
         for (int t = 0; t < seq; ++t)
             layernorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L.ln_1_w),
-                      model.at(L.ln_1_b), ln.data() + static_cast<std::size_t>(t) * d, d,
-                      c.ln_eps);
+                      model.at(L.ln_1_b), ln.data() + static_cast<std::size_t>(t) * d, d, c.ln_eps);
         if (dump_dir) npy::save_2d(dir + "/" + tag + ".ln_1.npy", ln, seq, d);
 
         attention(ln.data(), model.at(L.c_attn_w), model.at(L.c_attn_b), model.at(L.c_proj_w),
@@ -211,8 +210,7 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
         // ln_2 -> MLP -> residual 2.
         for (int t = 0; t < seq; ++t)
             layernorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L.ln_2_w),
-                      model.at(L.ln_2_b), ln.data() + static_cast<std::size_t>(t) * d, d,
-                      c.ln_eps);
+                      model.at(L.ln_2_b), ln.data() + static_cast<std::size_t>(t) * d, d, c.ln_eps);
         if (dump_dir) npy::save_2d(dir + "/" + tag + ".ln_2.npy", ln, seq, d);
 
         linear(ln.data(), model.at(L.mlp_fc_w), model.at(L.mlp_fc_b), mlp_h.data(), seq, d, dm);
@@ -285,8 +283,7 @@ std::vector<float> forward_cached(const Model& model, KVCache& cache,
 
         for (int i = 0; i < n_new; ++i)
             layernorm(x.data() + static_cast<std::size_t>(i) * d, model.at(L.ln_1_w),
-                      model.at(L.ln_1_b), ln.data() + static_cast<std::size_t>(i) * d, d,
-                      c.ln_eps);
+                      model.at(L.ln_1_b), ln.data() + static_cast<std::size_t>(i) * d, d, c.ln_eps);
 
         attention_kv(ln.data(), model.at(L.c_attn_w), model.at(L.c_attn_b), model.at(L.c_proj_w),
                      model.at(L.c_proj_b), attn.data(), cache, l, n_new, n_past, d, c.n_heads);
@@ -294,13 +291,12 @@ std::vector<float> forward_cached(const Model& model, KVCache& cache,
 
         for (int i = 0; i < n_new; ++i)
             layernorm(x.data() + static_cast<std::size_t>(i) * d, model.at(L.ln_2_w),
-                      model.at(L.ln_2_b), ln.data() + static_cast<std::size_t>(i) * d, d,
-                      c.ln_eps);
+                      model.at(L.ln_2_b), ln.data() + static_cast<std::size_t>(i) * d, d, c.ln_eps);
 
         linear(ln.data(), model.at(L.mlp_fc_w), model.at(L.mlp_fc_b), mlp_h.data(), n_new, d, dm);
         gelu_tanh(mlp_h.data(), static_cast<int>(mlp_h.size()));
-        linear(mlp_h.data(), model.at(L.mlp_proj_w), model.at(L.mlp_proj_b), mlp.data(), n_new,
-               dm, d);
+        linear(mlp_h.data(), model.at(L.mlp_proj_w), model.at(L.mlp_proj_b), mlp.data(), n_new, dm,
+               d);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] += mlp[i];
     }
 
