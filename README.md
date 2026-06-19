@@ -4,86 +4,40 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 
-A from-scratch LLM inference engine in C++. It loads a real model's weights,
-runs the entire transformer forward pass by hand, and is optimized to compete
-with [`llama.cpp`](https://github.com/ggerganov/llama.cpp) on CPU: **no PyTorch,
-no BLAS, no ML or math frameworks**. The standard library and OpenMP are the only
-things linked.
+`inference-engine` is a CPU language-model inference engine written in C++ with no machine-learning or math-library dependencies. It reads GPT-2 124M weights from disk, runs the full transformer forward pass directly, and generates text with greedy decoding and a KV cache. The standard library and, optionally, OpenMP are the only libraries linked. It provides a readable, framework-free implementation of transformer inference at the level of memory and arithmetic.
 
-> **Status: generating text, with a KV cache.** The full GPT-2 124M forward pass
-> runs by hand and produces coherent English, verified token-for-token against
-> HuggingFace (see [Verification](#verification-the-actual-hard-part)).
-> Generation now uses a KV cache, so per-token cost is roughly flat in sequence
-> length instead of the old O(n²) re-forward. Next up is the performance work
-> (SIMD, multithreading, cache tiling) — see the [roadmap](#roadmap).
+> Status: the weight loader, byte-level BPE decoding, the GPT-2 124M forward pass, and KV-cached greedy generation are implemented and tested. The forward pass matches a HuggingFace GPT-2 reference token-for-token on the reference prompt. BPE encoding, the SIMD and multithreaded GEMM kernels, quantization, and the Llama port are not yet implemented.
 
-## Why
+## Features
 
-Single-token LLM generation is, under the hood, a fixed sequence of matrix
-multiplications plus a handful of other operations. Writing that out by hand,
-and then making it fast, sits at the intersection of low-level systems work and
-machine learning. This project is that exercise end to end: correctness first,
-then the performance work (SIMD, cache blocking, multithreading, quantization)
-that actually earns a benchmark.
+- Loads GPT-2 124M from a flat binary produced by the included Python exporter.
+- Implements the full transformer forward pass by hand: token and learned position embeddings, pre-LayerNorm blocks, multi-head causal self-attention, a tanh-approximation GELU MLP, and a tied language-model head.
+- Provides a KV cache for incremental decoding, so per-token cost is independent of sequence length rather than quadratic.
+- Decodes byte-level BPE token ids to text using the GPT-2 byte-to-unicode mapping. Encoding is not yet implemented.
+- Generates text with greedy (argmax) sampling and streams each token as it is produced.
+- Includes a reference-diffing harness that dumps every intermediate activation and compares it against a HuggingFace reference.
+- Links no PyTorch and no BLAS; uses only the C++17 standard library and optional OpenMP.
+- Builds with CMake (with a Makefile wrapper), runs unit tests through CTest, and tests on GCC and Clang in CI.
 
 ## How it works
 
-The forward pass is the path an input takes through the network to predict the
-next token. For a GPT-style model it repeats one block many times:
+The forward pass repeats a single transformer block. Each block applies LayerNorm, multi-head causal self-attention, a second LayerNorm, and a two-layer MLP with a tanh-approximation GELU activation, with residual connections around the attention and MLP sublayers. GPT-2 uses learned absolute position embeddings, pre-LayerNorm placement, and a token embedding matrix tied to the output projection. A final LayerNorm precedes the language-model head.
 
-- **Attention**: lets every token look at every other token and decide what
-  matters.
-- **MLP** (feed-forward): a couple of large matrix multiplies that do most of
-  the compute.
-- **LayerNorm / RMSNorm**: keeps activations from blowing up or vanishing.
+Two compute regimes appear during generation:
 
-Two performance regimes hide inside "make the matmul fast", and the engine
-treats them differently:
+| Phase   | Operation                    | Limited by         |
+|---------|------------------------------|--------------------|
+| Prefill | matrix-matrix product (GEMM) | compute throughput |
+| Decode  | matrix-vector product (GEMV) | memory bandwidth   |
 
-| Regime    | Operation        | Bottleneck         | What helps                    |
-|-----------|------------------|--------------------|-------------------------------|
-| Prefill   | matrix × matrix  | compute (FLOPs)    | tiling / cache blocking, SIMD |
-| Decode    | matrix × vector  | memory bandwidth   | SIMD, quantization (fewer bytes/token) |
+Prefill processes the whole prompt at once. Decode processes one token per step. The KV cache stores each layer's keys and values as they are computed, so a decode step computes the query, key, and value for only the new token and attends over the cached history. The cached path (`forward_cached`) and the uncached path (`forward`) are checked for identical output.
 
-A **KV cache** stores the keys and values from previous tokens so decode only
-computes the new token's worth of work, instead of recomputing the whole
-sequence every step. The engine does this: prefill runs the whole prompt through
-once and fills the cache; each decode step then computes Q/K/V for the single
-new token, appends its K/V, and attends over everything cached so far. That is
-also where the matrix × *vector* (GEMV) decode regime above first appears, and it
-drops generation from O(n²) to roughly flat per-token cost.
+## Requirements
 
-## Verification (the actual hard part)
-
-The tricky bugs here aren't crashes; they're a single transposed matrix or an
-off-by-one in the attention mask that makes the output *almost* right. So the
-project is built around a reference-diffing harness:
-
-1. `tools/reference.py` runs the HuggingFace reference model on one frozen prompt
-   and dumps **every** intermediate tensor.
-2. The C++ engine dumps the same tensors for the same input (`IE_DUMP_DIR=<dir>`).
-3. `tests/check_layers.py` diffs them and reports the **first** layer where they
-   diverge.
-
-That turns "stare at twelve layers of code" into "layer 4's attention output is
-wrong, look there."
-
-One honest subtlety: per-tensor error **accumulates** through the stack — fp32
-rounding around GPT-2's high-magnitude features pushes the deepest layers past a
-tight `1e-4` threshold even when the arithmetic is exactly right (the per-layer
-error climbs and then *falls* as the final LayerNorm re-normalizes it). So the
-real correctness test isn't raw max-abs-error; it's whether greedy decoding picks
-the **same token**. `tests/check_argmax.py` checks exactly that against the
-reference logits — and it matches at every position.
-
-The KV cache has its own correctness gate: cached generation must produce the
-*identical* token sequence as the old no-cache forward. `tests/test_kv_cache.cpp`
-(run by CTest) proves this hermetically on a tiny in-memory model — no weights,
-no Python — and `--check-cache` runs the same comparison on the real model.
+- A C++17 compiler and CMake 3.16 or newer. OpenMP is used if present.
+- Python 3 with the packages in `requirements.txt` (`numpy`, `torch`, `transformers`) for weight export, reference dumps, and the diff scripts. The engine itself has no runtime dependencies.
 
 ## Build
-
-Requires a C++17 compiler and CMake ≥ 3.16. (OpenMP is used if present.)
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -91,18 +45,31 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Or use the convenience wrapper:
+A Makefile wraps the common steps:
 
 ```bash
-make        # configure + build
+make        # configure and build
 make test   # run the unit tests
 make run    # build and print the CLI help
 ```
 
-### Run
+## Configuration
 
-The weights and tokenizer aren't committed (the weights are large). Export them
-once with the Python tooling:
+Build-time options, passed with `-D` (for example `cmake -S . -B build -DIE_SANITIZE=ON`):
+
+| Option                  | Default | Effect                                   |
+|-------------------------|---------|------------------------------------------|
+| `IE_BUILD_TESTS`        | `ON`    | Build the unit tests                     |
+| `IE_ENABLE_NATIVE`      | `ON`    | Compile with `-march=native` (AVX2/FMA)  |
+| `IE_ENABLE_OPENMP`      | `ON`    | Link OpenMP if available                 |
+| `IE_WARNINGS_AS_ERRORS` | `OFF`   | Treat compiler warnings as errors        |
+| `IE_SANITIZE`           | `OFF`   | Enable Address and UB sanitizers         |
+
+## Usage
+
+The weights and tokenizer are not committed. Export them once with the Python tooling.
+
+### Export the model and tokenizer
 
 ```bash
 python -m pip install -r requirements.txt
@@ -110,7 +77,7 @@ python tools/export_weights.py   --model gpt2  --out models/gpt2-124m.bin
 python tools/convert_tokenizer.py --from-hf gpt2 --out models/tokenizer.bin
 ```
 
-Then generate:
+### Generate text
 
 ```bash
 ./build/inference-engine --model models/gpt2-124m.bin --tokens 20
@@ -120,98 +87,108 @@ Then generate:
 The quick brown foxes are a great way to get a little bit of a kick out of your dog.
 ```
 
-Sampling is greedy (argmax). Generation uses a KV cache, so per-token cost is
-roughly flat in sequence length rather than O(n²). The BPE `encode()` still isn't
-implemented, so the prompt is read from a fixed token-id file (`--input-ids`,
-defaulting to the reference prompt) rather than `--prompt`; that switches over
-once the encoder lands.
+The BPE encoder is not implemented, so the prompt is supplied as token ids through `--input-ids` (which defaults to the reference prompt) rather than through `--prompt`. Generation uses the KV cache by default.
 
-To confirm the cache changes nothing about the output, `--check-cache` greedily
-decodes both ways (cached and the old full re-forward) and verifies the generated
-tokens are identical:
+### Command-line options
+
+| Flag               | Default                                | Description                                                  |
+|--------------------|----------------------------------------|--------------------------------------------------------------|
+| `--model <path>`   | required                               | Model binary from `tools/export_weights.py`                  |
+| `--tokens <N>`     | `64`                                   | Number of tokens to generate                                 |
+| `--tokenizer <path>` | `models/tokenizer.bin`               | Tokenizer binary used to decode output; falls back to raw ids |
+| `--input-ids <path>` | `tests/reference_dumps/input_ids.npy` | Prompt token ids, used in place of `--prompt`               |
+| `--prompt <text>`  | `"The quick brown fox"`                | Currently ignored; `encode()` is not implemented             |
+| `--check-cache`    |                                        | Compare cached and uncached generation, then exit            |
+| `-h`, `--help`     |                                        | Print usage and exit                                         |
+
+Setting the `IE_DUMP_DIR` environment variable runs a single forward pass that dumps every activation, instead of generating text.
+
+## Testing
+
+Unit tests build with the project and run through CTest:
 
 ```bash
-./build/inference-engine --model models/gpt2-124m.bin --tokens 20 --check-cache
+ctest --test-dir build --output-on-failure
 ```
 
-To re-verify the forward pass against the reference instead of generating, set
-`IE_DUMP_DIR` (this runs a single forward and dumps every activation):
+| Test                  | Checks                                                       |
+|-----------------------|-------------------------------------------------------------|
+| `gemm_correctness`    | The naive matmul against a known result                     |
+| `loader_roundtrip`    | The binary loader and tokenizer decode on generated fixtures |
+| `kv_cache_equivalence`| Cached and uncached generation produce identical tokens      |
+
+`tests/make_fixtures.py` writes model and tokenizer fixtures in the on-disk format; `test_loader --fixture <dir>` then loads them, confirming the Python writers and the C++ readers agree on the byte layout. `make format` runs clang-format. CI builds and tests on GCC and Clang, checks formatting with clang-format, and lints the Python tooling with ruff.
+
+## Verification
+
+The subtle failures in a project like this are not crashes but a single transposed weight or an off-by-one in the causal mask that makes the output almost correct. The repository includes a reference-diffing harness for catching these.
+
+1. `tools/reference.py` runs HuggingFace GPT-2 on a fixed prompt and writes every intermediate tensor to `tests/reference_dumps/`.
+2. Running the engine with `IE_DUMP_DIR` set writes the same tensors for the same input.
+3. `tests/check_layers.py` reports the first tensor whose maximum absolute error exceeds a threshold.
+
+Per-tensor error accumulates through the network because of fp32 rounding, so deep layers can exceed a tight threshold while still being correct. The decisive check is whether greedy decoding selects the same token. `tests/check_argmax.py` compares the argmax of the engine and reference logits at every position.
 
 ```bash
+python tools/reference.py --model gpt2 --out-dir tests/reference_dumps
 IE_DUMP_DIR=tests/engine_dumps ./build/inference-engine --model models/gpt2-124m.bin
 python tests/check_layers.py --reference tests/reference_dumps --engine tests/engine_dumps
 python tests/check_argmax.py --reference tests/reference_dumps --engine tests/engine_dumps
 ```
 
-### Useful build options
+The KV cache has a separate check: cached generation must produce the same tokens as the uncached path. `--check-cache` runs both on the loaded model and compares them.
 
-| Option                  | Default | Effect                                   |
-|-------------------------|---------|------------------------------------------|
-| `IE_ENABLE_NATIVE`      | `ON`    | Compile with `-march=native` (AVX2/FMA)  |
-| `IE_ENABLE_OPENMP`      | `ON`    | Link OpenMP for multithreading if found  |
-| `IE_SANITIZE`           | `OFF`   | Address + UB sanitizers (great for debugging the forward pass) |
-| `IE_WARNINGS_AS_ERRORS` | `OFF`   | Treat warnings as errors                 |
+```bash
+./build/inference-engine --model models/gpt2-124m.bin --tokens 20 --check-cache
+```
 
-## Roadmap
-
-- [x] Repo scaffolding, CMake build, CI, naive GEMM + test
-- [x] **Phase 1**: Weight export + BPE tokenizer (`decode` first)
-- [x] **Phase 2**: Full forward pass, naive matmul, coherent GPT-2 text (verified against reference)
-- [x] **Phase 3**: KV cache (the unusable → usable jump)
-- [ ] **Phase 4**: GEMM optimization (AVX2, multithreading, cache tiling)
-- [ ] **Phase 5**: int8, then int4 quantization
-- [ ] **Phase 6**: Port to a ~1B Llama (RoPE, SwiGLU, GQA, RMSNorm) + benchmark vs `llama.cpp`
-
-## Benchmark
-
-Measured per regime (prefill and decode are different problems and lumping them
-hides the story), on the same model, machine, quantization, and thread count as
-`llama.cpp`'s own `llama-bench`. Numbers land here once Phase 6 is done.
-
-| Model | Regime  | engine (tok/s) | llama.cpp (tok/s) | ratio |
-|-------|---------|---------------:|------------------:|------:|
-| TBD   | prefill | TBD            | TBD               | TBD   |
-| TBD   | decode  | TBD            | TBD               | TBD   |
-
-**Honest target:** `llama.cpp` is years of hand-tuned kernels. A from-scratch
-CPU engine landing within **2-4×** of its tokens/sec on the same hardware is a
-strong result; "same order of magnitude" is the win. The writeup will focus on
-*the gap and what would close it*, which is more interesting than a single
-number.
+The equivalent check on a small in-memory model runs as part of the test suite (`tests/test_kv_cache.cpp`).
 
 ## Project layout
 
 ```
 inference-engine/
 ├── src/
-│   ├── main.cpp          # CLI + generation loop
-│   ├── model.{cpp,hpp}   # config, weight loading
-│   ├── tokenizer.*       # byte-level BPE
-│   ├── forward.*         # the forward pass + building blocks
-│   ├── kv_cache.hpp      # per-layer key/value cache (incremental decode)
-│   ├── gemm.*            # matmul kernels: naive → SIMD → threaded → tiled
-│   └── quant.*           # int8 / int4 quantization
+│   ├── main.cpp             # CLI, generation loop, verification and cache-check modes
+│   ├── model.{cpp,hpp}      # config and weight loading
+│   ├── tokenizer.{cpp,hpp}  # byte-level BPE (decode implemented, encode pending)
+│   ├── forward.{cpp,hpp}    # forward pass, cached and uncached
+│   ├── kv_cache.hpp         # per-layer key/value cache
+│   ├── gemm.{cpp,hpp}       # matmul and linear kernels
+│   ├── quant.{cpp,hpp}      # int8 quantization (scaffolding)
+│   └── npy.hpp              # minimal .npy reader/writer for the harness
 ├── tools/
-│   ├── export_weights.py    # HF weights → flat binary
-│   ├── convert_tokenizer.py # HF vocab + merges → flat tokenizer.bin
-│   └── reference.py         # dump reference activations (verification harness)
+│   ├── export_weights.py    # HF weights to flat binary
+│   ├── convert_tokenizer.py # HF vocab and merges to tokenizer binary
+│   ├── reference.py         # dump reference activations
+│   └── format_spec.py       # shared on-disk format definitions
 ├── tests/
-│   ├── test_gemm.cpp     # C++ unit test (run by CTest/CI)
-│   ├── test_loader.cpp   # loader + decode round-trip (run by CTest/CI)
-│   ├── test_kv_cache.cpp # cached == uncached generation (run by CTest/CI)
-│   ├── check_layers.py   # diff engine dumps vs reference (per-tensor error)
-│   └── check_argmax.py   # the real check: greedy token matches the reference
+│   ├── test_gemm.cpp        # matmul unit test
+│   ├── test_loader.cpp      # loader and decode test
+│   ├── test_kv_cache.cpp    # cached vs uncached equivalence
+│   ├── make_fixtures.py     # cross-language fixtures
+│   ├── check_layers.py      # per-tensor diff against reference
+│   └── check_argmax.py      # greedy-token match against reference
 ├── CMakeLists.txt
+├── Makefile
 └── .github/workflows/ci.yml
 ```
 
+## Roadmap
+
+- [x] Build system, CI, naive GEMM, weight export
+- [x] Phase 1: weight export and BPE decode
+- [x] Phase 2: forward pass and greedy generation, verified against the reference
+- [x] Phase 3: KV cache
+- [ ] Phase 4: GEMM optimization (AVX2, multithreading, cache tiling)
+- [ ] Phase 5: int8 and int4 quantization
+- [ ] Phase 6: port to a ~1B Llama model (RoPE, SwiGLU, GQA, RMSNorm) and benchmark against llama.cpp
+
 ## References
 
-- Andrej Karpathy's [`llm.c`](https://github.com/karpathy/llm.c): a clean
-  reference implementation of exactly this idea.
-- [`llama.cpp`](https://github.com/ggerganov/llama.cpp): the benchmark, and a
-  goldmine of CPU kernel tricks.
-- The original GPT-2 and Llama papers for the architecture details.
+- Andrej Karpathy, [`llm.c`](https://github.com/karpathy/llm.c)
+- [`llama.cpp`](https://github.com/ggerganov/llama.cpp)
+- The GPT-2 and Llama papers for the architecture details
 
 ## License
 
