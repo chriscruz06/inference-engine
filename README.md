@@ -10,11 +10,12 @@ with [`llama.cpp`](https://github.com/ggerganov/llama.cpp) on CPU: **no PyTorch,
 no BLAS, no ML or math frameworks**. The standard library and OpenMP are the only
 things linked.
 
-> **Status: generating text.** The full GPT-2 124M forward pass runs by hand and
-> produces coherent English, verified token-for-token against HuggingFace (see
-> [Verification](#verification-the-actual-hard-part)). The weight loader, the
-> byte-level BPE `decode`, and the naive GEMM are in place and tested. Next up is
-> the KV cache and the performance work — see the [roadmap](#roadmap).
+> **Status: generating text, with a KV cache.** The full GPT-2 124M forward pass
+> runs by hand and produces coherent English, verified token-for-token against
+> HuggingFace (see [Verification](#verification-the-actual-hard-part)).
+> Generation now uses a KV cache, so per-token cost is roughly flat in sequence
+> length instead of the old O(n²) re-forward. Next up is the performance work
+> (SIMD, multithreading, cache tiling) — see the [roadmap](#roadmap).
 
 ## Why
 
@@ -44,10 +45,13 @@ treats them differently:
 | Prefill   | matrix × matrix  | compute (FLOPs)    | tiling / cache blocking, SIMD |
 | Decode    | matrix × vector  | memory bandwidth   | SIMD, quantization (fewer bytes/token) |
 
-A KV cache stores the keys and values from previous tokens so decode only
+A **KV cache** stores the keys and values from previous tokens so decode only
 computes the new token's worth of work, instead of recomputing the whole
-sequence every step. (Not yet implemented — generation today is correct but
-O(n²); see the roadmap.)
+sequence every step. The engine does this: prefill runs the whole prompt through
+once and fills the cache; each decode step then computes Q/K/V for the single
+new token, appends its K/V, and attends over everything cached so far. That is
+also where the matrix × *vector* (GEMV) decode regime above first appears, and it
+drops generation from O(n²) to roughly flat per-token cost.
 
 ## Verification (the actual hard part)
 
@@ -71,6 +75,11 @@ error climbs and then *falls* as the final LayerNorm re-normalizes it). So the
 real correctness test isn't raw max-abs-error; it's whether greedy decoding picks
 the **same token**. `tests/check_argmax.py` checks exactly that against the
 reference logits — and it matches at every position.
+
+The KV cache has its own correctness gate: cached generation must produce the
+*identical* token sequence as the old no-cache forward. `tests/test_kv_cache.cpp`
+(run by CTest) proves this hermetically on a tiny in-memory model — no weights,
+no Python — and `--check-cache` runs the same comparison on the real model.
 
 ## Build
 
@@ -111,11 +120,19 @@ Then generate:
 The quick brown foxes are a great way to get a little bit of a kick out of your dog.
 ```
 
-Sampling is greedy (argmax), and there's no KV cache yet, so generation is O(n²)
-in sequence length — keep `--tokens` modest for now. The BPE `encode()` isn't
-implemented either, so the prompt is read from a fixed token-id file
-(`--input-ids`, defaulting to the reference prompt) rather than `--prompt`; that
-switches over once the encoder lands.
+Sampling is greedy (argmax). Generation uses a KV cache, so per-token cost is
+roughly flat in sequence length rather than O(n²). The BPE `encode()` still isn't
+implemented, so the prompt is read from a fixed token-id file (`--input-ids`,
+defaulting to the reference prompt) rather than `--prompt`; that switches over
+once the encoder lands.
+
+To confirm the cache changes nothing about the output, `--check-cache` greedily
+decodes both ways (cached and the old full re-forward) and verifies the generated
+tokens are identical:
+
+```bash
+./build/inference-engine --model models/gpt2-124m.bin --tokens 20 --check-cache
+```
 
 To re-verify the forward pass against the reference instead of generating, set
 `IE_DUMP_DIR` (this runs a single forward and dumps every activation):
@@ -140,7 +157,7 @@ python tests/check_argmax.py --reference tests/reference_dumps --engine tests/en
 - [x] Repo scaffolding, CMake build, CI, naive GEMM + test
 - [x] **Phase 1**: Weight export + BPE tokenizer (`decode` first)
 - [x] **Phase 2**: Full forward pass, naive matmul, coherent GPT-2 text (verified against reference)
-- [ ] **Phase 3**: KV cache (the unusable → usable jump)
+- [x] **Phase 3**: KV cache (the unusable → usable jump)
 - [ ] **Phase 4**: GEMM optimization (AVX2, multithreading, cache tiling)
 - [ ] **Phase 5**: int8, then int4 quantization
 - [ ] **Phase 6**: Port to a ~1B Llama (RoPE, SwiGLU, GQA, RMSNorm) + benchmark vs `llama.cpp`
@@ -167,12 +184,13 @@ number.
 ```
 inference-engine/
 ├── src/
-│   ├── main.cpp         # CLI + generation loop
-│   ├── model.{cpp,hpp}  # config, weight loading
-│   ├── tokenizer.*      # byte-level BPE
-│   ├── forward.*        # the forward pass + building blocks
-│   ├── gemm.*           # matmul kernels: naive → SIMD → threaded → tiled
-│   └── quant.*          # int8 / int4 quantization
+│   ├── main.cpp          # CLI + generation loop
+│   ├── model.{cpp,hpp}   # config, weight loading
+│   ├── tokenizer.*       # byte-level BPE
+│   ├── forward.*         # the forward pass + building blocks
+│   ├── kv_cache.hpp      # per-layer key/value cache (incremental decode)
+│   ├── gemm.*            # matmul kernels: naive → SIMD → threaded → tiled
+│   └── quant.*           # int8 / int4 quantization
 ├── tools/
 │   ├── export_weights.py    # HF weights → flat binary
 │   ├── convert_tokenizer.py # HF vocab + merges → flat tokenizer.bin
@@ -180,6 +198,7 @@ inference-engine/
 ├── tests/
 │   ├── test_gemm.cpp     # C++ unit test (run by CTest/CI)
 │   ├── test_loader.cpp   # loader + decode round-trip (run by CTest/CI)
+│   ├── test_kv_cache.cpp # cached == uncached generation (run by CTest/CI)
 │   ├── check_layers.py   # diff engine dumps vs reference (per-tensor error)
 │   └── check_argmax.py   # the real check: greedy token matches the reference
 ├── CMakeLists.txt

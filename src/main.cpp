@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "forward.hpp"
+#include "kv_cache.hpp"
 #include "model.hpp"
 #include "npy.hpp"
 #include "tokenizer.hpp"
@@ -18,7 +19,7 @@ void print_usage(const char* prog) {
         "\n"
         "Usage:\n"
         "  %s --model <path> [--prompt \"...\"] [--tokens N] [--tokenizer <path>]\n"
-        "     [--input-ids <path>]\n"
+        "     [--input-ids <path>] [--check-cache]\n"
         "\n"
         "Options:\n"
         "  --model      <path>   Path to a model exported by tools/export_weights.py\n"
@@ -31,6 +32,9 @@ void print_usage(const char* prog) {
         "  --input-ids  <path>   Token ids fed as the prompt -- encode() is still a stub, so\n"
         "                        the prompt is read from here for now\n"
         "                        (default: tests/reference_dumps/input_ids.npy)\n"
+        "  --check-cache         Greedy-decode both with and without the KV cache and verify\n"
+        "                        the token sequences are identical, then exit. The Phase-3\n"
+        "                        correctness check, on the real model.\n"
         "  -h, --help            Show this help and exit\n"
         "\n"
         "Set IE_DUMP_DIR=<dir> to run a single forward pass that dumps every activation\n"
@@ -59,6 +63,7 @@ int main(int argc, char** argv) {
     std::string tokenizer_path = "models/tokenizer.bin";
     std::string input_ids_path = "tests/reference_dumps/input_ids.npy";
     int n_tokens = 64;
+    bool check_cache = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -80,6 +85,8 @@ int main(int argc, char** argv) {
             tokenizer_path = take_value("--tokenizer");
         } else if (std::strcmp(arg, "--input-ids") == 0) {
             input_ids_path = take_value("--input-ids");
+        } else if (std::strcmp(arg, "--check-cache") == 0) {
+            check_cache = true;
         } else if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -120,12 +127,19 @@ int main(int argc, char** argv) {
     }
     (void)prompt;  // unused until encode() is implemented
 
-    // --- Verification mode -------------------------------------------------
+    const int n_ctx = model.config.n_ctx;
+    if (static_cast<int>(ids.size()) >= n_ctx) {
+        std::fprintf(stderr, "[gen] prompt (%zu tokens) is already at the context limit (%d)\n",
+                     ids.size(), n_ctx);
+        return 1;
+    }
+
+    // --- Verification mode (layer diff) ------------------------------------
     // With IE_DUMP_DIR set, run exactly ONE forward over the prompt ids so
     // forward() dumps every activation, then stop. This is the
-    // tests/check_layers.py path and it must stay a single forward: generating
-    // would overwrite the dumps with a longer sequence that no longer matches
-    // the 4-token reference.
+    // tests/check_layers.py path; it uses the uncached forward (which dumps all
+    // positions) and must stay a single forward so the dumps line up with the
+    // fixed reference prompt.
     if (const char* dump_dir = std::getenv("IE_DUMP_DIR")) {
         std::printf("[verify] %zu prompt tokens from '%s'\n", ids.size(),
                     input_ids_path.c_str());
@@ -136,12 +150,65 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // --- KV-cache equivalence check (Phase 3) ------------------------------
+    // Greedy-decode the prompt both with the cache and with the old O(n^2) full
+    // re-forward, and confirm the generated token ids are identical -- the
+    // gameplan's Phase-3 "done when" on the real model. (The hermetic version
+    // that CTest runs lives in tests/test_kv_cache.cpp.)
+    if (check_cache) {
+        const int prompt_n = static_cast<int>(ids.size());
+        int budget = n_tokens;
+        if (prompt_n + budget >= n_ctx) budget = n_ctx - prompt_n - 1;
+        if (budget < 1) {
+            std::fprintf(stderr, "[check-cache] prompt too long to compare any tokens\n");
+            return 1;
+        }
+        std::printf("[check-cache] greedy-decoding %d tokens with and without the KV cache...\n",
+                    budget);
+
+        // Uncached: the Phase-2 path -- full forward over the growing sequence.
+        std::vector<int> a = ids;
+        for (int s = 0; s < budget; ++s) {
+            const std::vector<float> lg = ie::forward(model, a);
+            a.push_back(argmax(lg));
+        }
+
+        // Cached: prefill once, then one token per decode step.
+        ie::KVCache cache;
+        cache.init(model.config);
+        std::vector<int> b = ids;
+        std::vector<float> lg = ie::forward_cached(model, cache, ids, 0);
+        for (int s = 0; s < budget; ++s) {
+            const int next = argmax(lg);
+            b.push_back(next);
+            if (s + 1 < budget)
+                lg = ie::forward_cached(model, cache, std::vector<int>{next}, cache.len);
+        }
+
+        int first_div = -1;
+        for (int s = 0; s < budget; ++s) {
+            if (a[static_cast<std::size_t>(prompt_n + s)] !=
+                b[static_cast<std::size_t>(prompt_n + s)]) {
+                first_div = s;
+                break;
+            }
+        }
+        if (first_div < 0) {
+            std::printf("[check-cache] PASS: all %d generated tokens identical.\n", budget);
+            return 0;
+        }
+        std::fprintf(stderr,
+                     "[check-cache] FAIL at generated token %d: uncached %d vs cached %d\n",
+                     first_div, a[static_cast<std::size_t>(prompt_n + first_div)],
+                     b[static_cast<std::size_t>(prompt_n + first_div)]);
+        return 1;
+    }
+
     // --- Generation mode ---------------------------------------------------
-    // Greedy decoding: forward over the whole sequence, take the argmax logit as
-    // the next token, append it, repeat. No KV cache yet (Phase 3), so every
-    // step re-runs the full forward over the growing sequence -- correct, but
-    // O(n^2). forward() also computes logits for every position when only the
-    // last is needed here; both costs go away when the cache lands.
+    // Greedy decoding with a KV cache: prefill the prompt once (filling the
+    // cache), then each step take the argmax logit, append it, and decode just
+    // that one new token. Per-token cost is now roughly flat in sequence length
+    // instead of the old O(n^2) full re-forward.
     ie::Tokenizer tok;
     const bool have_tok = tok.load(tokenizer_path);
     if (!have_tok) {
@@ -152,34 +219,22 @@ int main(int argc, char** argv) {
                      tokenizer_path.c_str(), tokenizer_path.c_str());
     }
 
-    const int n_ctx = model.config.n_ctx;
-    if (static_cast<int>(ids.size()) >= n_ctx) {
-        std::fprintf(stderr, "[gen] prompt (%zu tokens) is already at the context limit (%d)\n",
-                     ids.size(), n_ctx);
-        return 1;
-    }
+    std::printf("[gen] generating up to %d tokens (KV cache enabled)...\n\n", n_tokens);
 
-    std::printf("[gen] generating up to %d tokens (no KV cache yet -- this is O(n^2))...\n\n",
-                n_tokens);
-
-    // Echo the prompt, then stream each new token as it's produced. decode()
-    // concatenates each token's bytes independently, so the new token's text is
-    // exactly the next chunk of output -- no need to re-decode the whole
-    // sequence. A multi-byte UTF-8 char split across two tokens still prints
-    // correctly: its bytes emit in order across steps and the terminal
-    // reassembles them.
+    // Echo the prompt, then stream each new token as it's produced.
     if (have_tok) {
         const std::string prompt_text = tok.decode(ids);
         std::fwrite(prompt_text.data(), 1, prompt_text.size(), stdout);
         std::fflush(stdout);
     }
 
+    ie::KVCache cache;
+    cache.init(model.config);
+
+    // Prefill the whole prompt; the returned logits predict the first new token.
+    std::vector<float> logits = ie::forward_cached(model, cache, ids, 0);
+
     for (int step = 0; step < n_tokens; ++step) {
-        if (static_cast<int>(ids.size()) >= n_ctx) {
-            std::fprintf(stderr, "\n[gen] hit context limit (%d); stopping early.\n", n_ctx);
-            break;
-        }
-        const std::vector<float> logits = ie::forward(model, ids);
         const int next = argmax(logits);
         ids.push_back(next);
 
@@ -190,6 +245,15 @@ int main(int argc, char** argv) {
         } else {
             std::printf("%d ", next);
         }
+
+        // Can't cache another position past the context window.
+        if (cache.len >= n_ctx) {
+            std::fprintf(stderr, "\n[gen] hit context limit (%d); stopping early.\n", n_ctx);
+            break;
+        }
+        // Decode the token just emitted to get logits for the next one.
+        if (step + 1 < n_tokens)
+            logits = ie::forward_cached(model, cache, std::vector<int>{next}, cache.len);
     }
     std::printf("\n");
     return 0;
