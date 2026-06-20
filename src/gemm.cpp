@@ -43,8 +43,8 @@ namespace {
 inline float hsum256(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
-    lo = _mm_add_ps(lo, hi);                // 4 partial sums
-    __m128 shuf = _mm_movehdup_ps(lo);      // duplicate odd lanes
+    lo = _mm_add_ps(lo, hi);            // 4 partial sums
+    __m128 shuf = _mm_movehdup_ps(lo);  // duplicate odd lanes
     __m128 sums = _mm_add_ps(lo, shuf);
     shuf = _mm_movehl_ps(shuf, sums);
     sums = _mm_add_ss(sums, shuf);
@@ -92,8 +92,10 @@ void linear_avx2(const float* x, const float* w, const float* bias, float* y, in
             for (; i + 32 <= in_dim; i += 32) {  // 32 floats/iter; GPT-2 dims (768, 3072) are exact
                 a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i), _mm256_loadu_ps(wr + i), a0);
                 a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i + 8), _mm256_loadu_ps(wr + i + 8), a1);
-                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i + 16), _mm256_loadu_ps(wr + i + 16), a2);
-                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i + 24), _mm256_loadu_ps(wr + i + 24), a3);
+                a2 =
+                    _mm256_fmadd_ps(_mm256_loadu_ps(xr + i + 16), _mm256_loadu_ps(wr + i + 16), a2);
+                a3 =
+                    _mm256_fmadd_ps(_mm256_loadu_ps(xr + i + 24), _mm256_loadu_ps(wr + i + 24), a3);
             }
             for (; i + 8 <= in_dim; i += 8)  // 8-wide remainder
                 a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i), _mm256_loadu_ps(wr + i), a0);
