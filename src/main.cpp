@@ -1,4 +1,7 @@
 // src/main.cpp
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +12,7 @@
 #include "kv_cache.hpp"
 #include "model.hpp"
 #include "npy.hpp"
+#include "profile.hpp"
 #include "tokenizer.hpp"
 
 namespace {
@@ -19,7 +23,7 @@ void print_usage(const char* prog) {
         "\n"
         "Usage:\n"
         "  %s --model <path> [--prompt \"...\"] [--tokens N] [--tokenizer <path>]\n"
-        "     [--input-ids <path>] [--check-cache]\n"
+        "     [--input-ids <path>] [--check-cache] [--bench]\n"
         "\n"
         "Options:\n"
         "  --model      <path>   Path to a model exported by tools/export_weights.py\n"
@@ -35,6 +39,13 @@ void print_usage(const char* prog) {
         "  --check-cache         Greedy-decode both with and without the KV cache and verify\n"
         "                        the token sequences are identical, then exit. The Phase-3\n"
         "                        correctness check, on the real model.\n"
+        "  --bench               Benchmark prefill (GEMM) and decode (GEMV) tokens/sec\n"
+        "                        separately on synthetic input, then exit. The Phase-4\n"
+        "                        baseline that the kernel work is measured against.\n"
+        "  --bench-prefill <N>   Prefill length for --bench (default: 128)\n"
+        "  --bench-decode  <N>   Decode steps for --bench (default: 64)\n"
+        "  --bench-iters   <N>   Timed iterations for --bench; the median is reported\n"
+        "                        (default: 5, plus one warmup)\n"
         "  -h, --help            Show this help and exit\n"
         "\n"
         "Set IE_DUMP_DIR=<dir> to run a single forward pass that dumps every activation\n"
@@ -55,6 +66,113 @@ int argmax(const std::vector<float>& v) {
     return best;
 }
 
+// Median of a list of timings (sorts a copy).
+double median(std::vector<double> xs) {
+    if (xs.empty()) return 0.0;
+    std::sort(xs.begin(), xs.end());
+    const std::size_t n = xs.size();
+    return (n % 2 == 1) ? xs[n / 2] : 0.5 * (xs[n / 2 - 1] + xs[n / 2]);
+}
+
+// Benchmark the two compute regimes separately:
+//   prefill -> one forward_cached over the whole prompt   (matrix x matrix, GEMM)
+//   decode  -> N single-token forward_cached steps        (matrix x vector, GEMV)
+// Token VALUES don't affect timing (only the matmul shapes do), so a synthetic
+// deterministic prompt stands in for real text -- no tokenizer or input-ids file
+// is needed. Every per-step cost the engine pays today (including the per-call
+// temporary allocations inside forward_cached) is included, so this is the
+// honest baseline the Phase-4 optimizations are measured against.
+int run_bench(const ie::Model& model, int prefill_len, int decode_steps, int iters) {
+    using clock = std::chrono::steady_clock;
+    const int n_ctx = model.config.n_ctx;
+    const int V = model.config.vocab_size;
+
+    if (prefill_len < 1) prefill_len = 1;
+    if (iters < 1) iters = 1;
+    if (decode_steps < 0) decode_steps = 0;
+    // Keep the whole run inside the context window.
+    if (prefill_len >= n_ctx) prefill_len = n_ctx - 1;
+    if (prefill_len + decode_steps >= n_ctx) decode_steps = n_ctx - prefill_len - 1;
+    if (decode_steps < 0) decode_steps = 0;
+
+    // Deterministic, valid token ids. Values are irrelevant to timing.
+    std::vector<int> prompt(static_cast<std::size_t>(prefill_len));
+    for (int i = 0; i < prefill_len; ++i) {
+        const unsigned h = static_cast<unsigned>(i) * 2654435761u + 12345u;
+        prompt[static_cast<std::size_t>(i)] = static_cast<int>(h % static_cast<unsigned>(V));
+    }
+
+    std::printf("[bench] %d layers, d_model=%d, d_mlp=%d, vocab=%d, n_ctx=%d\n",
+                model.config.n_layers, model.config.d_model, model.config.d_mlp, V, n_ctx);
+    std::printf("[bench] prefill=%d  decode=%d  iters=%d (+1 warmup)\n", prefill_len, decode_steps,
+                iters);
+
+    // Per-shape matmul profiling, on only when IE_PROFILE is set. Prefill and
+    // decode get separate breakdowns because their matmul mix differs sharply:
+    // in prefill every position flows through the projections (big GEMM) but the
+    // LM head runs once; in decode each projection sees one row yet the full
+    // 768x50257 head still runs every step, so it dominates a decode step.
+    const bool profile = std::getenv("IE_PROFILE") != nullptr;
+
+    ie::KVCache cache;
+    cache.init(model.config);
+
+    double checksum = 0.0;  // accumulated so the work can't be dead-code-eliminated
+
+    // ---- Prefill: fresh cache, one forward_cached over the whole prompt. ----
+    {
+        std::vector<double> secs;
+        secs.reserve(static_cast<std::size_t>(iters));
+        for (int it = 0; it < iters + 1; ++it) {  // iteration 0 is warmup
+            cache.clear();
+            ie::prof::registry().enabled = profile;
+            if (it == 1) ie::prof::registry().reset();  // drop warmup from the buckets
+            const auto t0 = clock::now();
+            const std::vector<float> lg = ie::forward_cached(model, cache, prompt, 0);
+            const auto t1 = clock::now();
+            checksum += static_cast<double>(lg.empty() ? 0.0f : lg[0]);
+            if (it > 0) secs.push_back(std::chrono::duration<double>(t1 - t0).count());
+        }
+        const double med = median(secs);
+        const double tps = med > 0.0 ? prefill_len / med : 0.0;
+        std::printf("[bench] prefill: %9.3f ms median  ->  %9.1f tok/s\n", med * 1e3, tps);
+        if (profile) ie::prof::registry().report("prefill");
+    }
+
+    // ---- Decode: prefill (untimed) then time `decode_steps` single tokens. ----
+    if (decode_steps > 0) {
+        std::vector<double> secs;
+        secs.reserve(static_cast<std::size_t>(iters));
+        for (int it = 0; it < iters + 1; ++it) {  // iteration 0 is warmup
+            cache.clear();
+            ie::prof::registry().enabled = false;  // don't profile the setup prefill
+            std::vector<float> lg = ie::forward_cached(model, cache, prompt, 0);
+            int next = argmax(lg);
+            if (it == 1) ie::prof::registry().reset();  // drop warmup's decode buckets
+            ie::prof::registry().enabled = profile;     // profile only the decode steps
+            const auto t0 = clock::now();
+            for (int s = 0; s < decode_steps; ++s) {
+                lg = ie::forward_cached(model, cache, std::vector<int>{next}, cache.len);
+                next = argmax(lg);
+            }
+            const auto t1 = clock::now();
+            ie::prof::registry().enabled = false;
+            checksum += static_cast<double>(next);
+            if (it > 0) secs.push_back(std::chrono::duration<double>(t1 - t0).count());
+        }
+        const double med = median(secs);
+        const double tps = med > 0.0 ? decode_steps / med : 0.0;
+        const double ms_per = med * 1e3 / decode_steps;
+        std::printf("[bench] decode:  %9.3f ms median  ->  %9.1f tok/s  (%.3f ms/token)\n",
+                    med * 1e3, tps, ms_per);
+        if (profile) ie::prof::registry().report("decode");
+    }
+
+    ie::prof::registry().enabled = false;
+    std::printf("[bench] (checksum %.6f -- ignore; defeats dead-code elimination)\n", checksum);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -64,6 +182,10 @@ int main(int argc, char** argv) {
     std::string input_ids_path = "tests/reference_dumps/input_ids.npy";
     int n_tokens = 64;
     bool check_cache = false;
+    bool bench = false;
+    int bench_prefill = 128;
+    int bench_decode = 64;
+    int bench_iters = 5;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -87,6 +209,14 @@ int main(int argc, char** argv) {
             input_ids_path = take_value("--input-ids");
         } else if (std::strcmp(arg, "--check-cache") == 0) {
             check_cache = true;
+        } else if (std::strcmp(arg, "--bench") == 0) {
+            bench = true;
+        } else if (std::strcmp(arg, "--bench-prefill") == 0) {
+            bench_prefill = std::atoi(take_value("--bench-prefill"));
+        } else if (std::strcmp(arg, "--bench-decode") == 0) {
+            bench_decode = std::atoi(take_value("--bench-decode"));
+        } else if (std::strcmp(arg, "--bench-iters") == 0) {
+            bench_iters = std::atoi(take_value("--bench-iters"));
         } else if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -116,6 +246,14 @@ int main(int argc, char** argv) {
     std::printf("[model] loaded '%s': %d layers, d_model=%d, vocab=%d\n", model_path.c_str(),
                 model.config.n_layers, model.config.d_model, model.config.vocab_size);
 
+    // --- Benchmark mode ----------------------------------------------------
+    // Synthetic and self-contained (no tokenizer or input-ids file needed): time
+    // prefill and decode separately so the Phase-4 kernel work has a baseline to
+    // beat. Runs before the prompt is loaded so --bench works with just --model.
+    if (bench) {
+        return run_bench(model, bench_prefill, bench_decode, bench_iters);
+    }
+
     // Prompt tokens. encode() is still a stub, so the prompt is fed as reference
     // token ids from --input-ids rather than tokenized from --prompt. Once
     // encode() lands, this becomes `ids = tok.encode(prompt)`.
@@ -135,11 +273,6 @@ int main(int argc, char** argv) {
     }
 
     // --- Verification mode (layer diff) ------------------------------------
-    // With IE_DUMP_DIR set, run exactly ONE forward over the prompt ids so
-    // forward() dumps every activation, then stop. This is the
-    // tests/check_layers.py path; it uses the uncached forward (which dumps all
-    // positions) and must stay a single forward so the dumps line up with the
-    // fixed reference prompt.
     if (const char* dump_dir = std::getenv("IE_DUMP_DIR")) {
         std::printf("[verify] %zu prompt tokens from '%s'\n", ids.size(), input_ids_path.c_str());
         const std::vector<float> logits = ie::forward(model, ids);
@@ -150,10 +283,6 @@ int main(int argc, char** argv) {
     }
 
     // --- KV-cache equivalence check (Phase 3) ------------------------------
-    // Greedy-decode the prompt both with the cache and with the old O(n^2) full
-    // re-forward, and confirm the generated token ids are identical -- the
-    // gameplan's Phase-3 "done when" on the real model. (The hermetic version
-    // that CTest runs lives in tests/test_kv_cache.cpp.)
     if (check_cache) {
         const int prompt_n = static_cast<int>(ids.size());
         int budget = n_tokens;
@@ -165,14 +294,12 @@ int main(int argc, char** argv) {
         std::printf("[check-cache] greedy-decoding %d tokens with and without the KV cache...\n",
                     budget);
 
-        // Uncached: the Phase-2 path -- full forward over the growing sequence.
         std::vector<int> a = ids;
         for (int s = 0; s < budget; ++s) {
             const std::vector<float> lg = ie::forward(model, a);
             a.push_back(argmax(lg));
         }
 
-        // Cached: prefill once, then one token per decode step.
         ie::KVCache cache;
         cache.init(model.config);
         std::vector<int> b = ids;
@@ -203,10 +330,6 @@ int main(int argc, char** argv) {
     }
 
     // --- Generation mode ---------------------------------------------------
-    // Greedy decoding with a KV cache: prefill the prompt once (filling the
-    // cache), then each step take the argmax logit, append it, and decode just
-    // that one new token. Per-token cost is now roughly flat in sequence length
-    // instead of the old O(n^2) full re-forward.
     ie::Tokenizer tok;
     const bool have_tok = tok.load(tokenizer_path);
     if (!have_tok) {
@@ -219,7 +342,6 @@ int main(int argc, char** argv) {
 
     std::printf("[gen] generating up to %d tokens (KV cache enabled)...\n\n", n_tokens);
 
-    // Echo the prompt, then stream each new token as it's produced.
     if (have_tok) {
         const std::string prompt_text = tok.decode(ids);
         std::fwrite(prompt_text.data(), 1, prompt_text.size(), stdout);
@@ -229,7 +351,6 @@ int main(int argc, char** argv) {
     ie::KVCache cache;
     cache.init(model.config);
 
-    // Prefill the whole prompt; the returned logits predict the first new token.
     std::vector<float> logits = ie::forward_cached(model, cache, ids, 0);
 
     for (int step = 0; step < n_tokens; ++step) {
@@ -244,12 +365,10 @@ int main(int argc, char** argv) {
             std::printf("%d ", next);
         }
 
-        // Can't cache another position past the context window.
         if (cache.len >= n_ctx) {
             std::fprintf(stderr, "\n[gen] hit context limit (%d); stopping early.\n", n_ctx);
             break;
         }
-        // Decode the token just emitted to get logits for the next one.
         if (step + 1 < n_tokens)
             logits = ie::forward_cached(model, cache, std::vector<int>{next}, cache.len);
     }
