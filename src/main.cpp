@@ -1,6 +1,7 @@
 // src/main.cpp
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -23,7 +24,8 @@ void print_usage(const char* prog) {
         "\n"
         "Usage:\n"
         "  %s --model <path> [--prompt \"...\"] [--tokens N] [--tokenizer <path>]\n"
-        "     [--input-ids <path>] [--check-cache] [--bench]\n"
+        "     [--input-ids <path>] [--check-cache] [--bench] [--quant q8|q4]\n"
+        "     [--compare-quant]\n"
         "\n"
         "Options:\n"
         "  --model      <path>   Path to a model exported by tools/export_weights.py\n"
@@ -46,6 +48,16 @@ void print_usage(const char* prog) {
         "  --bench-decode  <N>   Decode steps for --bench (default: 64)\n"
         "  --bench-iters   <N>   Timed iterations for --bench; the median is reported\n"
         "                        (default: 5, plus one warmup)\n"
+        "  --quant      <mode>   Weight-only quantization for the streamed matmuls:\n"
+        "                        none (default), q8 (int8), or q4 (packed int4).\n"
+        "                        Shrinks decode's per-token weight stream; applies to\n"
+        "                        generation and --bench.\n"
+        "  --compare-quant       Greedy-decode --tokens steps fp32, then teacher-force\n"
+        "                        the quantized model on the same context and report the\n"
+        "                        token-match rate, first divergence, and mean logit\n"
+        "                        error (uses --quant's type; q8 if unset). Then exit.\n"
+        "  --quant-group <N>     Weights per shared scale (default: q8 64, q4 16). A\n"
+        "                        finer group trades footprint for accuracy.\n"
         "  -h, --help            Show this help and exit\n"
         "\n"
         "Set IE_DUMP_DIR=<dir> to run a single forward pass that dumps every activation\n"
@@ -173,6 +185,87 @@ int run_bench(const ie::Model& model, int prefill_len, int decode_steps, int ite
     return 0;
 }
 
+// Quantization accuracy probe. Greedy-decode `n` tokens with the fp32 model
+// (capturing the per-step logits), quantize the model in place, then teacher-force
+// the SAME context (prompt + the fp32-chosen tokens) through the quantized model
+// so both see identical inputs at every step. This isolates the quantization
+// perturbation from autoregressive drift and yields the end-to-end accuracy
+// numbers (token-match rate, first divergence, mean per-logit abs error). Mutates
+// `model` (it ends quantized); callers run it last.
+int run_compare_quant(ie::Model& model, const std::vector<int>& ids, int n, ie::QuantType type,
+                      int group) {
+    const int V = model.config.vocab_size;
+    const int n_ctx = model.config.n_ctx;
+    if (n < 1) n = 1;
+    if (static_cast<int>(ids.size()) + n >= n_ctx) n = n_ctx - static_cast<int>(ids.size()) - 1;
+    if (n < 1) {
+        std::fprintf(stderr, "[compare-quant] prompt too long to compare any tokens\n");
+        return 1;
+    }
+    const char* name = (type == ie::QuantType::Q8) ? "q8" : "q4";
+
+    ie::KVCache cache;
+    cache.init(model.config);
+
+    // ---- fp32 reference pass (model not yet quantized). ----
+    std::vector<int> gen;
+    gen.reserve(static_cast<std::size_t>(n));
+    std::vector<std::vector<float>> logits_fp32;
+    logits_fp32.reserve(static_cast<std::size_t>(n));
+    {
+        std::vector<float> lg = ie::forward_cached(model, cache, ids, 0);
+        for (int s = 0; s < n; ++s) {
+            logits_fp32.push_back(lg);
+            const int t = argmax(lg);
+            gen.push_back(t);
+            if (s + 1 < n) lg = ie::forward_cached(model, cache, std::vector<int>{t}, cache.len);
+        }
+    }
+
+    // ---- Quantize, then teacher-force the fp32 token stream. ----
+    std::size_t f32_bytes = 0;
+    const std::size_t q_bytes = ie::quantize_model(model, type, group, &f32_bytes);
+
+    int match = 0, first_div = -1;
+    double abs_err_sum = 0.0;
+    std::size_t logit_count = 0;
+    {
+        cache.clear();
+        std::vector<float> lg = ie::forward_cached(model, cache, ids, 0);
+        for (int s = 0; s < n; ++s) {
+            if (argmax(lg) == gen[static_cast<std::size_t>(s)])
+                ++match;
+            else if (first_div < 0)
+                first_div = s;
+            const std::vector<float>& lf = logits_fp32[static_cast<std::size_t>(s)];
+            for (int v = 0; v < V; ++v)
+                abs_err_sum += std::fabs(static_cast<double>(lg[static_cast<std::size_t>(v)]) -
+                                         static_cast<double>(lf[static_cast<std::size_t>(v)]));
+            logit_count += static_cast<std::size_t>(V);
+            if (s + 1 < n)
+                lg = ie::forward_cached(model, cache,
+                                        std::vector<int>{gen[static_cast<std::size_t>(s)]},
+                                        cache.len);
+        }
+    }
+
+    const double match_rate = 100.0 * match / n;
+    const double mean_logit_err = logit_count ? abs_err_sum / static_cast<double>(logit_count) : 0.0;
+    const double ratio = q_bytes > 0 ? static_cast<double>(f32_bytes) / static_cast<double>(q_bytes)
+                                     : 0.0;
+    std::printf("[compare-quant] %s (group %d) vs fp32 over %d teacher-forced steps:\n", name, group,
+                n);
+    std::printf("[compare-quant]   token match:        %d/%d (%.1f%%)\n", match, n, match_rate);
+    if (first_div < 0)
+        std::printf("[compare-quant]   first divergence:   none\n");
+    else
+        std::printf("[compare-quant]   first divergence:   step %d\n", first_div);
+    std::printf("[compare-quant]   mean per-logit error: %.4f\n", mean_logit_err);
+    std::printf("[compare-quant]   footprint:          %.1f MB quant vs %.1f MB fp32 (%.2fx)\n",
+                static_cast<double>(q_bytes) / 1e6, static_cast<double>(f32_bytes) / 1e6, ratio);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -186,6 +279,9 @@ int main(int argc, char** argv) {
     int bench_prefill = 128;
     int bench_decode = 64;
     int bench_iters = 5;
+    std::string quant_mode = "none";  // none | q8 | q4
+    bool compare_quant = false;
+    int quant_group = 0;  // 0 = auto (q8: 64, q4: 32); >0 overrides
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -217,6 +313,12 @@ int main(int argc, char** argv) {
             bench_decode = std::atoi(take_value("--bench-decode"));
         } else if (std::strcmp(arg, "--bench-iters") == 0) {
             bench_iters = std::atoi(take_value("--bench-iters"));
+        } else if (std::strcmp(arg, "--quant") == 0) {
+            quant_mode = take_value("--quant");
+        } else if (std::strcmp(arg, "--compare-quant") == 0) {
+            compare_quant = true;
+        } else if (std::strcmp(arg, "--quant-group") == 0) {
+            quant_group = std::atoi(take_value("--quant-group"));
         } else if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -246,6 +348,43 @@ int main(int argc, char** argv) {
     std::printf("[model] loaded '%s': %d layers, d_model=%d, vocab=%d\n", model_path.c_str(),
                 model.config.n_layers, model.config.d_model, model.config.vocab_size);
 
+    // --- Quantization (Phase 5) --------------------------------------------
+    // Resolve --quant and (unless we are comparing, which quantizes itself) build
+    // the int8/int4 weights in memory so --bench and generation use the quantized
+    // matmul kernels. The fp32 buffer is kept (biases, LayerNorm, embedding lookup
+    // still read it); forward() (the dump oracle) is unaffected and stays fp32.
+    ie::QuantType qtype = ie::QuantType::Q8;
+    bool want_quant = false;
+    if (quant_mode == "q8") {
+        want_quant = true;
+        qtype = ie::QuantType::Q8;
+    } else if (quant_mode == "q4") {
+        want_quant = true;
+        qtype = ie::QuantType::Q4;
+    } else if (quant_mode != "none") {
+        std::fprintf(stderr, "error: --quant must be one of none|q8|q4 (got '%s')\n",
+                     quant_mode.c_str());
+        return 2;
+    }
+    // Group size: explicit --quant-group wins; otherwise int4 uses a much finer
+    // group (16) than int8 (64). int4's 16 code levels are coarse enough that on a
+    // small, quantization-sensitive model like GPT-2 124M, groups of 32/64
+    // collapse into repetition; group 16 is the coherence floor here (measured via
+    // --compare-quant, logged in BENCH.md).
+    const int group = quant_group > 0 ? quant_group
+                                      : (qtype == ie::QuantType::Q4 ? 16 : ie::kQuantGroup);
+    if (want_quant && !compare_quant) {
+        std::size_t f32_bytes = 0;
+        const std::size_t q_bytes = ie::quantize_model(model, qtype, group, &f32_bytes);
+        const double ratio = q_bytes > 0 ? static_cast<double>(f32_bytes) /
+                                               static_cast<double>(q_bytes)
+                                         : 0.0;
+        std::printf(
+            "[quant] %s: matmul weights %.1f MB quantized vs %.1f MB fp32 (%.2fx smaller)\n",
+            quant_mode.c_str(), static_cast<double>(q_bytes) / 1e6,
+            static_cast<double>(f32_bytes) / 1e6, ratio);
+    }
+
     // --- Benchmark mode ----------------------------------------------------
     // Synthetic and self-contained (no tokenizer or input-ids file needed): time
     // prefill and decode separately so the Phase-4 kernel work has a baseline to
@@ -270,6 +409,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gen] prompt (%zu tokens) is already at the context limit (%d)\n",
                      ids.size(), n_ctx);
         return 1;
+    }
+
+    // --- Quantization accuracy comparison (Phase 5) ------------------------
+    if (compare_quant) {
+        std::printf("[compare-quant] %zu prompt tokens; comparing %s against fp32...\n", ids.size(),
+                    qtype == ie::QuantType::Q8 ? "q8" : "q4");
+        return run_compare_quant(model, ids, n_tokens, qtype, group);
     }
 
     // --- Verification mode (layer diff) ------------------------------------

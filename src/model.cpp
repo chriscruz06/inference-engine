@@ -111,4 +111,34 @@ bool load_model(const std::string& path, Model& out) {
     return true;
 }
 
+std::size_t quantize_model(Model& m, QuantType type, int group, std::size_t* fp32_bytes_out) {
+    const ModelConfig& c = m.config;
+    const int D = c.d_model, M = c.d_mlp, V = c.vocab_size;
+
+    m.quant_type = type;
+    m.qlayers.assign(static_cast<std::size_t>(c.n_layers), QuantLayerWeights{});
+
+    std::size_t qbytes = 0, fbytes = 0;
+    auto do_one = [&](std::size_t off, int out_dim, int in_dim, QuantTensor& dst) {
+        quantize_tensor(m.at(off), out_dim, in_dim, type, group, dst);
+        qbytes += dst.bytes();
+        fbytes += static_cast<std::size_t>(out_dim) * static_cast<std::size_t>(in_dim) *
+                  sizeof(float);
+    };
+
+    for (int l = 0; l < c.n_layers; ++l) {
+        const LayerWeights& L = m.w.layers[static_cast<std::size_t>(l)];
+        QuantLayerWeights& Q = m.qlayers[static_cast<std::size_t>(l)];
+        do_one(L.c_attn_w, 3 * D, D, Q.c_attn_w);
+        do_one(L.c_proj_w, D, D, Q.c_proj_w);
+        do_one(L.mlp_fc_w, M, D, Q.mlp_fc_w);
+        do_one(L.mlp_proj_w, D, M, Q.mlp_proj_w);
+    }
+    do_one(m.w.wte, V, D, m.q_head);  // tied LM head (wte reused as [vocab, d])
+
+    m.quantized = true;
+    if (fp32_bytes_out) *fp32_bytes_out = fbytes;
+    return qbytes;
+}
+
 }  // namespace ie

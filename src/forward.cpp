@@ -111,15 +111,16 @@ static void attention(const float* x, const float* c_attn_w, const float* c_attn
 // n_past + i) attends causally over cached keys 0..(n_past + i). With n_past == 0
 // and n_new == seq this computes exactly what attention() above does; with
 // n_new == 1 it is the single-token decode step (Q is one vector -> GEMV).
-static void attention_kv(const float* xn, const float* c_attn_w, const float* c_attn_b,
-                         const float* c_proj_w, const float* c_proj_b, float* out, KVCache& cache,
-                         int layer, int n_new, int n_past, int d, int n_heads) {
+static void attention_kv(const float* xn, const LinearWeight& c_attn_w, const float* c_attn_b,
+                         const LinearWeight& c_proj_w, const float* c_proj_b, float* out,
+                         KVCache& cache, int layer, int n_new, int n_past, int d, int n_heads) {
     const int hd = d / n_heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
-    // 1) Fused QKV projection for the new tokens only -> [n_new, 3d].
+    // 1) Fused QKV projection for the new tokens only -> [n_new, 3d]. The weight
+    // is fp32 or quantized depending on the LinearWeight (decode's bandwidth win).
     std::vector<float> qkv(static_cast<std::size_t>(n_new) * 3 * static_cast<std::size_t>(d));
-    linear(xn, c_attn_w, c_attn_b, qkv.data(), n_new, d, 3 * d);
+    linear(xn, c_attn_w, c_attn_b, qkv.data(), n_new);
 
     // 2) Append this chunk's K and V into the cache (full d-row per position).
     const std::size_t row = static_cast<std::size_t>(3) * d;  // stride of one qkv row
@@ -156,7 +157,7 @@ static void attention_kv(const float* xn, const float* c_attn_w, const float* c_
     }
 
     // 4) Output projection -> [n_new, d].
-    linear(context.data(), c_proj_w, c_proj_b, out, n_new, d, d);
+    linear(context.data(), c_proj_w, c_proj_b, out, n_new);
 }
 
 std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
@@ -278,25 +279,39 @@ std::vector<float> forward_cached(const Model& model, KVCache& cache,
 
     // ---- Transformer blocks. Identical pre-LN GPT-2 block to forward(), except
     // attention reads/writes the KV cache instead of recomputing the past. ----
+    // Resolve a streamed matmul weight to fp32 or its quantized copy. When the
+    // model is not quantized the QuantTensor pointer is ignored and the fp32
+    // offset is used, so this path is byte-identical to before. (qlayers is empty
+    // unless quantize_model() ran, so it is only indexed when `quantized`.)
+    const bool Q = model.quantized;
+    auto LW = [&](std::size_t off, const QuantTensor* qt, int in, int out) -> LinearWeight {
+        if (Q) return LinearWeight{nullptr, qt, in, out};
+        return LinearWeight{model.at(off), nullptr, in, out};
+    };
+
     for (int l = 0; l < c.n_layers; ++l) {
         const LayerWeights& L = model.w.layers[static_cast<std::size_t>(l)];
+        const QuantLayerWeights* ql = Q ? &model.qlayers[static_cast<std::size_t>(l)] : nullptr;
 
         for (int i = 0; i < n_new; ++i)
             layernorm(x.data() + static_cast<std::size_t>(i) * d, model.at(L.ln_1_w),
                       model.at(L.ln_1_b), ln.data() + static_cast<std::size_t>(i) * d, d, c.ln_eps);
 
-        attention_kv(ln.data(), model.at(L.c_attn_w), model.at(L.c_attn_b), model.at(L.c_proj_w),
-                     model.at(L.c_proj_b), attn.data(), cache, l, n_new, n_past, d, c.n_heads);
+        const LinearWeight w_cattn = LW(L.c_attn_w, ql ? &ql->c_attn_w : nullptr, d, 3 * d);
+        const LinearWeight w_cproj = LW(L.c_proj_w, ql ? &ql->c_proj_w : nullptr, d, d);
+        attention_kv(ln.data(), w_cattn, model.at(L.c_attn_b), w_cproj, model.at(L.c_proj_b),
+                     attn.data(), cache, l, n_new, n_past, d, c.n_heads);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] += attn[i];
 
         for (int i = 0; i < n_new; ++i)
             layernorm(x.data() + static_cast<std::size_t>(i) * d, model.at(L.ln_2_w),
                       model.at(L.ln_2_b), ln.data() + static_cast<std::size_t>(i) * d, d, c.ln_eps);
 
-        linear(ln.data(), model.at(L.mlp_fc_w), model.at(L.mlp_fc_b), mlp_h.data(), n_new, d, dm);
+        const LinearWeight w_fc = LW(L.mlp_fc_w, ql ? &ql->mlp_fc_w : nullptr, d, dm);
+        const LinearWeight w_proj = LW(L.mlp_proj_w, ql ? &ql->mlp_proj_w : nullptr, dm, d);
+        linear(ln.data(), w_fc, model.at(L.mlp_fc_b), mlp_h.data(), n_new);
         gelu_tanh(mlp_h.data(), static_cast<int>(mlp_h.size()));
-        linear(mlp_h.data(), model.at(L.mlp_proj_w), model.at(L.mlp_proj_b), mlp.data(), n_new, dm,
-               d);
+        linear(mlp_h.data(), w_proj, model.at(L.mlp_proj_b), mlp.data(), n_new);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] += mlp[i];
     }
 
@@ -312,7 +327,9 @@ std::vector<float> forward_cached(const Model& model, KVCache& cache,
     layernorm(x_last, model.at(model.w.ln_f_w), model.at(model.w.ln_f_b), lnf.data(), d, c.ln_eps);
 
     std::vector<float> logits(static_cast<std::size_t>(V));
-    linear(lnf.data(), wte, nullptr, logits.data(), 1, d, V);
+    const LinearWeight head =
+        Q ? LinearWeight{nullptr, &model.q_head, d, V} : LinearWeight{wte, nullptr, d, V};
+    linear(lnf.data(), head, nullptr, logits.data(), 1);
     return logits;
 }
 

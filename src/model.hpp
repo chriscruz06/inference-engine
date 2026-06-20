@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "quant.hpp"
+
 namespace ie {
 
 // Configuration for a GPT-2-style decoder-only transformer.
@@ -43,12 +45,32 @@ struct Weights {
     std::size_t ln_f_w = 0, ln_f_b = 0;
 };
 
+// Quantized copies of one block's four streamed matmul weights (Phase 5). Empty
+// until quantize_model() runs. The fp32 originals stay in Model::weights (biases,
+// LayerNorm, and the embedding lookup still read them); only the matmul reads
+// switch to these.
+struct QuantLayerWeights {
+    QuantTensor c_attn_w;   // [3*d_model, d_model]
+    QuantTensor c_proj_w;   // [d_model, d_model]
+    QuantTensor mlp_fc_w;   // [d_mlp, d_model]
+    QuantTensor mlp_proj_w;  // [d_model, d_mlp]
+};
+
 // Holds model weights loaded from disk: one flat fp32 buffer plus the offsets
 // that carve it into named tensors.
 struct Model {
     ModelConfig config;
     std::vector<float> weights;  // flat fp32 buffer, canonical tensor order
     Weights w;
+
+    // Phase 5: optional in-memory weight quantization. `quantized` flips the
+    // forward pass onto the quantized matmul kernels; the stores below hold the
+    // int8/int4 weights. wte stays fp32 for the embedding lookup, so the tied LM
+    // head gets its own quantized copy in `q_head`.
+    bool quantized = false;
+    QuantType quant_type = QuantType::Q8;
+    std::vector<QuantLayerWeights> qlayers;  // [n_layers], parallel to w.layers
+    QuantTensor q_head;                      // tied LM head: wte as [vocab, d_model]
 
     // Pointer to a tensor given its float offset into `weights`.
     const float* at(std::size_t offset) const { return weights.data() + offset; }
@@ -59,5 +81,14 @@ struct Model {
 // tensors in canonical order, and records per-tensor offsets in `out.w`.
 // Returns false (with a message on stderr) on any mismatch or I/O error.
 bool load_model(const std::string& path, Model& out);
+
+// Quantize the streamed matmul weights (per-layer c_attn / c_proj / mlp_fc /
+// mlp_proj, plus the tied LM head) in place into the model's quantized stores and
+// set `quantized = true`. The fp32 buffer is left intact. `group` defaults to the
+// model-wide kQuantGroup. Returns the total bytes of the quantized weights (for
+// footprint reporting); `fp32_bytes_out`, if non-null, receives the fp32 size of
+// the same matrices so the caller can quote the ratio.
+std::size_t quantize_model(Model& m, QuantType type, int group = kQuantGroup,
+                           std::size_t* fp32_bytes_out = nullptr);
 
 }  // namespace ie
