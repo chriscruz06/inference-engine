@@ -243,18 +243,18 @@ int run_compare_quant(ie::Model& model, const std::vector<int>& ids, int n, ie::
                                          static_cast<double>(lf[static_cast<std::size_t>(v)]));
             logit_count += static_cast<std::size_t>(V);
             if (s + 1 < n)
-                lg = ie::forward_cached(model, cache,
-                                        std::vector<int>{gen[static_cast<std::size_t>(s)]},
-                                        cache.len);
+                lg = ie::forward_cached(
+                    model, cache, std::vector<int>{gen[static_cast<std::size_t>(s)]}, cache.len);
         }
     }
 
     const double match_rate = 100.0 * match / n;
-    const double mean_logit_err = logit_count ? abs_err_sum / static_cast<double>(logit_count) : 0.0;
-    const double ratio = q_bytes > 0 ? static_cast<double>(f32_bytes) / static_cast<double>(q_bytes)
-                                     : 0.0;
-    std::printf("[compare-quant] %s (group %d) vs fp32 over %d teacher-forced steps:\n", name, group,
-                n);
+    const double mean_logit_err =
+        logit_count ? abs_err_sum / static_cast<double>(logit_count) : 0.0;
+    const double ratio =
+        q_bytes > 0 ? static_cast<double>(f32_bytes) / static_cast<double>(q_bytes) : 0.0;
+    std::printf("[compare-quant] %s (group %d) vs fp32 over %d teacher-forced steps:\n", name,
+                group, n);
     std::printf("[compare-quant]   token match:        %d/%d (%.1f%%)\n", match, n, match_rate);
     if (first_div < 0)
         std::printf("[compare-quant]   first divergence:   none\n");
@@ -371,14 +371,13 @@ int main(int argc, char** argv) {
     // small, quantization-sensitive model like GPT-2 124M, groups of 32/64
     // collapse into repetition; group 16 is the coherence floor here (measured via
     // --compare-quant, logged in BENCH.md).
-    const int group = quant_group > 0 ? quant_group
-                                      : (qtype == ie::QuantType::Q4 ? 16 : ie::kQuantGroup);
+    const int group =
+        quant_group > 0 ? quant_group : (qtype == ie::QuantType::Q4 ? 16 : ie::kQuantGroup);
     if (want_quant && !compare_quant) {
         std::size_t f32_bytes = 0;
         const std::size_t q_bytes = ie::quantize_model(model, qtype, group, &f32_bytes);
-        const double ratio = q_bytes > 0 ? static_cast<double>(f32_bytes) /
-                                               static_cast<double>(q_bytes)
-                                         : 0.0;
+        const double ratio =
+            q_bytes > 0 ? static_cast<double>(f32_bytes) / static_cast<double>(q_bytes) : 0.0;
         std::printf(
             "[quant] %s: matmul weights %.1f MB quantized vs %.1f MB fp32 (%.2fx smaller)\n",
             quant_mode.c_str(), static_cast<double>(q_bytes) / 1e6,

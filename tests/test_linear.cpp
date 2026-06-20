@@ -50,9 +50,9 @@ void check_shape(int rows, int in_dim, int out_dim, bool with_bias) {
     }
     const float tol = 1e-5f * mag + 1e-4f;  // relative to output scale, with an absolute floor
     const bool ok = diff <= tol;
-    std::printf("  rows=%-4d in=%-5d out=%-6d bias=%d  max|diff|=%.3e  tol=%.3e  %s\n", rows, in_dim,
-                out_dim, with_bias ? 1 : 0, static_cast<double>(diff), static_cast<double>(tol),
-                ok ? "ok" : "FAIL");
+    std::printf("  rows=%-4d in=%-5d out=%-6d bias=%d  max|diff|=%.3e  tol=%.3e  %s\n", rows,
+                in_dim, out_dim, with_bias ? 1 : 0, static_cast<double>(diff),
+                static_cast<double>(tol), ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
 
@@ -65,16 +65,16 @@ int main() {
     std::printf("[test_linear] build has no AVX2; linear() == linear_scalar (trivially equal)\n");
 #endif
     // GPT-2 124M shapes (prefill row count, then a single decode row), bias on.
-    check_shape(256, 768, 2304, true);   // QKV projection
-    check_shape(256, 768, 768, true);    // attention output projection
-    check_shape(256, 768, 3072, true);   // MLP up
-    check_shape(256, 3072, 768, true);   // MLP down
-    check_shape(1, 768, 50257, false);   // tied LM head, decode step (null bias)
-    check_shape(1, 3072, 768, true);     // a single-row MLP-down (decode)
+    check_shape(256, 768, 2304, true);  // QKV projection
+    check_shape(256, 768, 768, true);   // attention output projection
+    check_shape(256, 768, 3072, true);  // MLP up
+    check_shape(256, 3072, 768, true);  // MLP down
+    check_shape(1, 768, 50257, false);  // tied LM head, decode step (null bias)
+    check_shape(1, 3072, 768, true);    // a single-row MLP-down (decode)
     // Odd dims to exercise the 8-wide remainder and the scalar tail.
     check_shape(3, 100, 7, true);
     check_shape(5, 33, 17, false);
-    check_shape(2, 1, 4, true);          // in_dim < 8: scalar tail only
+    check_shape(2, 1, 4, true);  // in_dim < 8: scalar tail only
 
     if (g_fail == 0) {
         std::printf("test_linear: OK\n");

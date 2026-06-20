@@ -58,14 +58,15 @@ std::vector<float> dequant(const ie::QuantTensor& w) {
                 const std::uint8_t byte = w.q[static_cast<std::size_t>(o) * row_bytes + i / 2];
                 const int code = ((i & 1) == 0) ? (byte & 0x0F) : (byte >> 4);
                 const float s = w.scales[static_cast<std::size_t>(o) * gpr + i / w.group];
-                out[static_cast<std::size_t>(o) * w.in_dim + i] =
-                    static_cast<float>(code - 8) * s;
+                out[static_cast<std::size_t>(o) * w.in_dim + i] = static_cast<float>(code - 8) * s;
             }
     }
     return out;
 }
 
-const char* type_name(ie::QuantType t) { return t == ie::QuantType::Q8 ? "q8" : "q4"; }
+const char* type_name(ie::QuantType t) {
+    return t == ie::QuantType::Q8 ? "q8" : "q4";
+}
 
 void check_shape(ie::QuantType type, int rows, int in_dim, int out_dim, bool with_bias) {
     std::vector<float> x(static_cast<std::size_t>(rows) * in_dim);
@@ -87,7 +88,8 @@ void check_shape(ie::QuantType type, int rows, int in_dim, int out_dim, bool wit
         ie::linear_q8_scalar(x.data(), qw, bptr, y_scalar.data(), rows);
     else
         ie::linear_q4_scalar(x.data(), qw, bptr, y_scalar.data(), rows);
-    ie::linear(x.data(), ie::LinearWeight{nullptr, &qw, in_dim, out_dim}, bptr, y_fast.data(), rows);
+    ie::linear(x.data(), ie::LinearWeight{nullptr, &qw, in_dim, out_dim}, bptr, y_fast.data(),
+               rows);
 
     // (2 ref) plain fp32 dot over explicitly dequantized weights.
     const std::vector<float> wdq = dequant(qw);
@@ -106,7 +108,7 @@ void check_shape(ie::QuantType type, int rows, int in_dim, int out_dim, bool wit
         err2 += e * e;
         ref2 += static_cast<double>(y_true[i]) * static_cast<double>(y_true[i]);
     }
-    const float tol = 1e-4f * mag + 1e-3f;                 // FMA-reorder tolerance
+    const float tol = 1e-4f * mag + 1e-3f;                         // FMA-reorder tolerance
     const double rel = ref2 > 0.0 ? std::sqrt(err2 / ref2) : 0.0;  // L2 relative quant error
     const double rel_max = (type == ie::QuantType::Q8) ? 0.03 : 0.20;
 
@@ -114,9 +116,9 @@ void check_shape(ie::QuantType type, int rows, int in_dim, int out_dim, bool wit
     std::printf(
         "  %s rows=%-3d in=%-5d out=%-5d bias=%d  fast|scalar=%.2e deq=%.2e (tol=%.2e)  "
         "relerr=%.3f%% (<%.0f%%)  %s\n",
-        type_name(type), rows, in_dim, out_dim, with_bias ? 1 : 0,
-        static_cast<double>(d_fast), static_cast<double>(d_deq), static_cast<double>(tol),
-        rel * 100.0, rel_max * 100.0, ok ? "ok" : "FAIL");
+        type_name(type), rows, in_dim, out_dim, with_bias ? 1 : 0, static_cast<double>(d_fast),
+        static_cast<double>(d_deq), static_cast<double>(tol), rel * 100.0, rel_max * 100.0,
+        ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
 

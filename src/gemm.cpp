@@ -126,8 +126,7 @@ void linear_q8_avx2(const float* x, const QuantTensor& w, const float* bias, flo
     const int in_dim = w.in_dim, out_dim = w.out_dim, group = w.group;
     const int gpr = w.groups_per_row();
     const std::int8_t* q = reinterpret_cast<const std::int8_t*>(w.q.data());
-    [[maybe_unused]] const long long work =
-        static_cast<long long>(rows) * out_dim * in_dim;
+    [[maybe_unused]] const long long work = static_cast<long long>(rows) * out_dim * in_dim;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (work >= kLinearParallelMinWork)
 #endif
@@ -145,7 +144,8 @@ void linear_q8_avx2(const float* x, const QuantTensor& w, const float* bias, flo
                 __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
                 int i = 0;
                 for (; i + 32 <= n; i += 32) {
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + gs + i), cvt8_i8_ps(qrow + gs + i), a0);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + gs + i), cvt8_i8_ps(qrow + gs + i),
+                                         a0);
                     a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + gs + i + 8),
                                          cvt8_i8_ps(qrow + gs + i + 8), a1);
                     a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + gs + i + 16),
@@ -154,7 +154,8 @@ void linear_q8_avx2(const float* x, const QuantTensor& w, const float* bias, flo
                                          cvt8_i8_ps(qrow + gs + i + 24), a3);
                 }
                 for (; i + 8 <= n; i += 8)
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + gs + i), cvt8_i8_ps(qrow + gs + i), a0);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + gs + i), cvt8_i8_ps(qrow + gs + i),
+                                         a0);
                 __m256 acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
                 float part = hsum256(acc);
                 for (; i < n; ++i)
@@ -177,8 +178,7 @@ void linear_q4_avx2(const float* x, const QuantTensor& w, const float* bias, flo
     const std::size_t row_bytes = static_cast<std::size_t>((in_dim + 1) / 2);
     const __m128i lomask = _mm_set1_epi8(0x0F);
     const __m128i eight = _mm_set1_epi8(8);
-    [[maybe_unused]] const long long work =
-        static_cast<long long>(rows) * out_dim * in_dim;
+    [[maybe_unused]] const long long work = static_cast<long long>(rows) * out_dim * in_dim;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (work >= kLinearParallelMinWork)
 #endif
@@ -197,7 +197,7 @@ void linear_q4_avx2(const float* x, const QuantTensor& w, const float* bias, flo
                 for (; i + 16 <= n; i += 16) {
                     const __m128i packed =
                         _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qrow + (gs + i) / 2));
-                    const __m128i lo = _mm_and_si128(packed, lomask);             // even columns
+                    const __m128i lo = _mm_and_si128(packed, lomask);  // even columns
                     const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), lomask);  // odd
                     __m128i nib = _mm_unpacklo_epi8(lo, hi);  // 16 nibbles in column order
                     nib = _mm_sub_epi8(nib, eight);           // center to [-8,7]

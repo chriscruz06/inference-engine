@@ -50,9 +50,9 @@ struct Weights {
 // LayerNorm, and the embedding lookup still read them); only the matmul reads
 // switch to these.
 struct QuantLayerWeights {
-    QuantTensor c_attn_w;   // [3*d_model, d_model]
-    QuantTensor c_proj_w;   // [d_model, d_model]
-    QuantTensor mlp_fc_w;   // [d_mlp, d_model]
+    QuantTensor c_attn_w;    // [3*d_model, d_model]
+    QuantTensor c_proj_w;    // [d_model, d_model]
+    QuantTensor mlp_fc_w;    // [d_mlp, d_model]
     QuantTensor mlp_proj_w;  // [d_model, d_mlp]
 };
 

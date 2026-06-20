@@ -42,8 +42,8 @@ struct QuantTensor {
     int out_dim = 0;
     int in_dim = 0;
     int group = kQuantGroup;
-    std::vector<std::uint8_t> q;     // packed weights (see per-type note above)
-    std::vector<float> scales;       // out_dim * groups_per_row, one per group
+    std::vector<std::uint8_t> q;  // packed weights (see per-type note above)
+    std::vector<float> scales;    // out_dim * groups_per_row, one per group
 
     int groups_per_row() const { return (in_dim + group - 1) / group; }
     std::size_t bytes() const { return q.size() + scales.size() * sizeof(float); }

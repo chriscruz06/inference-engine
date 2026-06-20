@@ -122,8 +122,8 @@ std::size_t quantize_model(Model& m, QuantType type, int group, std::size_t* fp3
     auto do_one = [&](std::size_t off, int out_dim, int in_dim, QuantTensor& dst) {
         quantize_tensor(m.at(off), out_dim, in_dim, type, group, dst);
         qbytes += dst.bytes();
-        fbytes += static_cast<std::size_t>(out_dim) * static_cast<std::size_t>(in_dim) *
-                  sizeof(float);
+        fbytes +=
+            static_cast<std::size_t>(out_dim) * static_cast<std::size_t>(in_dim) * sizeof(float);
     };
 
     for (int l = 0; l < c.n_layers; ++l) {

@@ -84,7 +84,8 @@ void quantize_tensor(const float* w, int out_dim, int in_dim, QuantType type, in
                     if ((col & 1) == 0)
                         byte = static_cast<std::uint8_t>((byte & 0xF0) | nib);  // low nibble
                     else
-                        byte = static_cast<std::uint8_t>((byte & 0x0F) | (nib << 4));  // high nibble
+                        byte =
+                            static_cast<std::uint8_t>((byte & 0x0F) | (nib << 4));  // high nibble
                 }
             }
         }
