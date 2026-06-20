@@ -102,6 +102,10 @@ if(IE_BUILD_TESTS)
     target_link_libraries(test_loader PRIVATE ie_core)
     add_test(NAME loader_roundtrip COMMAND test_loader)
 
+    add_executable(test_linear tests/test_linear.cpp)
+    target_link_libraries(test_linear PRIVATE ie_core)
+    add_test(NAME linear_equivalence COMMAND test_linear)
+
     # KV-cache equivalence (Phase 3). Hermetic: builds a tiny model with small
     # deterministic weights in memory and proves cached and uncached generation
     # pick the same token at every step. No real weights or Python required.
