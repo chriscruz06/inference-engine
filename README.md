@@ -6,13 +6,14 @@
 
 `inference-engine` is a CPU language-model inference engine written in C++ with no machine-learning or math-library dependencies. It reads GPT-2 124M weights from disk, runs the full transformer forward pass directly, and generates text with greedy decoding and a KV cache. The standard library and, optionally, OpenMP are the only libraries linked. It provides a readable, framework-free implementation of transformer inference at the level of memory and arithmetic.
 
-> Status: the weight loader, byte-level BPE decoding, the GPT-2 124M forward pass, KV-cached greedy generation, and an AVX2-vectorized, multithreaded GEMM are implemented and tested. The forward pass matches a HuggingFace GPT-2 reference token-for-token on the reference prompt. BPE encoding, quantization, and the Llama port are not yet implemented.
+> Status: the weight loader, byte-level BPE decoding, the GPT-2 124M forward pass, KV-cached greedy generation, an AVX2-vectorized multithreaded GEMM, and weight-only int8/int4 quantization are implemented and tested. The forward pass matches a HuggingFace GPT-2 reference token-for-token on the reference prompt; int8 quantization is near-lossless and speeds up decode. BPE encoding and the Llama port are not yet implemented.
 
 ## Features
 
 - Loads GPT-2 124M from a flat binary produced by the included Python exporter.
 - Implements the full transformer forward pass by hand: token and learned position embeddings, pre-LayerNorm blocks, multi-head causal self-attention, a tanh-approximation GELU MLP, and a tied language-model head.
 - Optimizes the single `linear` kernel that serves both compute regimes: an AVX2 path (8-wide FMA with four accumulators) parallelized across cores with OpenMP over output features, gated by work size so the bandwidth-bound decode GEMV stays single-threaded.
+- Adds optional weight-only quantization (group-wise symmetric int8 and packed int4): the matmul weights are quantized in memory and the kernel dequantizes each group on the fly, shrinking the per-token weight stream that bounds decode.
 - Provides a KV cache for incremental decoding, so per-token cost is independent of sequence length rather than quadratic.
 - Decodes byte-level BPE token ids to text using the GPT-2 byte-to-unicode mapping. Encoding is not yet implemented.
 - Generates text with greedy (argmax) sampling and streams each token as it is produced.
@@ -55,6 +56,23 @@ Cache-blocking the prefill GEMM over the token dimension was implemented and ben
 ```
 
 Set `IE_PROFILE=1` on any run to break `linear` time down by matmul shape.
+
+### Quantization (Phase 5)
+
+Weight-only group-wise quantization shrinks the per-token weight stream that bounds decode. Same session, GPT-2 124M, prefill and decode 256:
+
+| Weights         | Decode tok/s | Footprint | Token match vs fp32 |
+|-----------------|-------------:|----------:|--------------------:|
+| fp32            |         36.1 |        1x |                   - |
+| int8 (group 64) |         46.6 |     3.76x |               95.8% |
+| int4 (group 16) |         21.4 |     5.33x |               64.6% |
+
+int8 lifts decode about 29% and is near-lossless (95.8% of greedy tokens match fp32, mean per-logit error 1.2). int4 shrinks the footprint further and stays coherent at a group of 16, but decode is *slower* than fp32 here: the nibble-unpack costs more ALU than an int8 load, and the finer group that int4 needs for coherence forces more per-group rescales than the bandwidth it saves on a model this small. int4's speed payoff is expected on the larger Llama port, where decode is more bandwidth-starved. The full accuracy and speed sweep (and the int4 negative result) is in [BENCH.md](BENCH.md).
+
+```bash
+./build/inference-engine --model models/gpt2-124m.bin --tokens 30 --quant q8        # generate (int8)
+./build/inference-engine --model models/gpt2-124m.bin --compare-quant --quant q8    # accuracy vs fp32
+```
 
 ## Requirements
 
@@ -124,6 +142,9 @@ The BPE encoder is not implemented, so the prompt is supplied as token ids throu
 | `--prompt <text>`  | `"The quick brown fox"`                | Currently ignored; `encode()` is not implemented             |
 | `--check-cache`    |                                        | Compare cached and uncached generation, then exit            |
 | `--bench`          |                                        | Benchmark prefill and decode tok/s separately, then exit     |
+| `--quant <mode>`   | `none`                                 | Weight-only quantization for the matmuls: `none`, `q8`, `q4` |
+| `--quant-group <N>`| q8 `64`, q4 `16`                       | Weights per shared scale; finer trades footprint for accuracy |
+| `--compare-quant`  |                                        | Report quantized-vs-fp32 token match, divergence, logit error, then exit |
 | `-h`, `--help`     |                                        | Print usage and exit                                         |
 
 In `--bench` mode, `--bench-prefill <N>`, `--bench-decode <N>`, and `--bench-iters <N>` set the prompt length, the number of generated tokens, and the count of timed iterations (the median is reported).
@@ -142,6 +163,7 @@ ctest --test-dir build --output-on-failure
 |-----------------------|-------------------------------------------------------------|
 | `gemm_correctness`    | The naive matmul against a known result                     |
 | `linear_equivalence`  | The AVX2 `linear` kernel against the scalar reference        |
+| `quant_equivalence`   | The AVX2 int8/int4 kernels against their scalar references and a dequant cross-check |
 | `loader_roundtrip`    | The binary loader and tokenizer decode on generated fixtures |
 | `kv_cache_equivalence`| Cached and uncached generation produce identical tokens      |
 
@@ -184,7 +206,7 @@ inference-engine/
 │   ├── kv_cache.hpp         # per-layer key/value cache
 │   ├── gemm.{cpp,hpp}       # linear/matmul kernels (scalar + AVX2 + OpenMP)
 │   ├── profile.hpp          # zero-overhead RAII wall-clock profiler (IE_PROFILE)
-│   ├── quant.{cpp,hpp}      # int8 quantization (scaffolding)
+│   ├── quant.{cpp,hpp}      # group-wise int8/int4 weight quantization
 │   └── npy.hpp              # minimal .npy reader/writer for the harness
 ├── tools/
 │   ├── export_weights.py    # HF weights to flat binary
@@ -194,6 +216,7 @@ inference-engine/
 ├── tests/
 │   ├── test_gemm.cpp        # matmul unit test
 │   ├── test_linear.cpp      # AVX2 vs scalar linear-kernel equivalence
+│   ├── test_quant.cpp       # int8/int4 quantized-kernel equivalence
 │   ├── test_loader.cpp      # loader and decode test
 │   ├── test_kv_cache.cpp    # cached vs uncached equivalence
 │   ├── make_fixtures.py     # cross-language fixtures
@@ -212,7 +235,7 @@ inference-engine/
 - [x] Phase 2: forward pass and greedy generation, verified against the reference
 - [x] Phase 3: KV cache
 - [x] Phase 4: GEMM optimization (AVX2 SIMD, multithreaded over output features)
-- [ ] Phase 5: int8 and int4 quantization
+- [x] Phase 5: weight-only int8 and int4 quantization (int8 the decode win; int4 tradeoffs documented)
 - [ ] Phase 6: port to a ~1B Llama model (RoPE, SwiGLU, GQA, RMSNorm) and benchmark against llama.cpp
 
 ## References
