@@ -6,12 +6,13 @@
 
 `inference-engine` is a CPU language-model inference engine written in C++ with no machine-learning or math-library dependencies. It reads GPT-2 124M weights from disk, runs the full transformer forward pass directly, and generates text with greedy decoding and a KV cache. The standard library and, optionally, OpenMP are the only libraries linked. It provides a readable, framework-free implementation of transformer inference at the level of memory and arithmetic.
 
-> Status: the weight loader, byte-level BPE decoding, the GPT-2 124M forward pass, and KV-cached greedy generation are implemented and tested. The forward pass matches a HuggingFace GPT-2 reference token-for-token on the reference prompt. BPE encoding, the SIMD and multithreaded GEMM kernels, quantization, and the Llama port are not yet implemented.
+> Status: the weight loader, byte-level BPE decoding, the GPT-2 124M forward pass, KV-cached greedy generation, and an AVX2-vectorized, multithreaded GEMM are implemented and tested. The forward pass matches a HuggingFace GPT-2 reference token-for-token on the reference prompt. BPE encoding, quantization, and the Llama port are not yet implemented.
 
 ## Features
 
 - Loads GPT-2 124M from a flat binary produced by the included Python exporter.
 - Implements the full transformer forward pass by hand: token and learned position embeddings, pre-LayerNorm blocks, multi-head causal self-attention, a tanh-approximation GELU MLP, and a tied language-model head.
+- Optimizes the single `linear` kernel that serves both compute regimes: an AVX2 path (8-wide FMA with four accumulators) parallelized across cores with OpenMP over output features, gated by work size so the bandwidth-bound decode GEMV stays single-threaded.
 - Provides a KV cache for incremental decoding, so per-token cost is independent of sequence length rather than quadratic.
 - Decodes byte-level BPE token ids to text using the GPT-2 byte-to-unicode mapping. Encoding is not yet implemented.
 - Generates text with greedy (argmax) sampling and streams each token as it is produced.
@@ -31,6 +32,29 @@ Two compute regimes appear during generation:
 | Decode  | matrix-vector product (GEMV) | memory bandwidth   |
 
 Prefill processes the whole prompt at once. Decode processes one token per step. The KV cache stores each layer's keys and values as they are computed, so a decode step computes the query, key, and value for only the new token and attends over the cached history. The cached path (`forward_cached`) and the uncached path (`forward`) are checked for identical output.
+
+A single `linear` kernel serves both regimes. It is vectorized with AVX2 (8-wide FMA, four independent accumulators to hide FMA latency) and parallelized with OpenMP over output features. A work-size gate keeps the parallel region off the small per-token GEMV of decode, where the bottleneck is memory bandwidth rather than cores.
+
+## Benchmarks
+
+Measured on GPT-2 124M (fp32), one socket, 8 physical cores, with the engine's `--bench` mode (median of several iterations after a warmup). Prefill and decode are reported separately because they are different problems: prefill is a compute-bound matrix-matrix product, decode a memory-bandwidth-bound matrix-vector product.
+
+| Kernel                          | Prefill tok/s | Decode tok/s |
+|---------------------------------|--------------:|-------------:|
+| Naive scalar (`-O2`, 1 thread)  |           9.1 |          6.0 |
+| AVX2 (8-wide FMA)               |          88.3 |         36.6 |
+| AVX2 + OpenMP (work-size gated) |         224.7 |         36.8 |
+
+The AVX2 step lifts both regimes (about 10x prefill, 6x decode). Multithreading then lifts prefill another ~2.5x but leaves decode flat: a decode step streams the entire weight set once per token and is capped by memory bandwidth, not cores, so the gate deliberately keeps it single-threaded. (Ungated, multithreading makes decode *slower* through fork/join and memory contention on one-row GEMVs.)
+
+Cache-blocking the prefill GEMM over the token dimension was implemented and benchmarked, then dropped: it gave no improvement over the multithreaded kernel on this hardware, because the activation that would be tiled already fits in shared L3, so its re-reads are L3 hits rather than RAM traffic. The remaining prefill scaling gap is shared-L3 bandwidth and all-core clock throttling, which cache blocking cannot address. Decode's wall is the same memory-bandwidth limit, addressed in Phase 5 by quantization (fewer bytes moved per token).
+
+```bash
+./build/inference-engine --model models/gpt2-124m.bin \
+    --bench --bench-prefill 256 --bench-decode 256 --bench-iters 3
+```
+
+Set `IE_PROFILE=1` on any run to break `linear` time down by matmul shape.
 
 ## Requirements
 
@@ -99,9 +123,12 @@ The BPE encoder is not implemented, so the prompt is supplied as token ids throu
 | `--input-ids <path>` | `tests/reference_dumps/input_ids.npy` | Prompt token ids, used in place of `--prompt`               |
 | `--prompt <text>`  | `"The quick brown fox"`                | Currently ignored; `encode()` is not implemented             |
 | `--check-cache`    |                                        | Compare cached and uncached generation, then exit            |
+| `--bench`          |                                        | Benchmark prefill and decode tok/s separately, then exit     |
 | `-h`, `--help`     |                                        | Print usage and exit                                         |
 
-Setting the `IE_DUMP_DIR` environment variable runs a single forward pass that dumps every activation, instead of generating text.
+In `--bench` mode, `--bench-prefill <N>`, `--bench-decode <N>`, and `--bench-iters <N>` set the prompt length, the number of generated tokens, and the count of timed iterations (the median is reported).
+
+Setting the `IE_DUMP_DIR` environment variable runs a single forward pass that dumps every activation, instead of generating text. Setting `IE_PROFILE=1` reports a breakdown of `linear` time by matmul shape.
 
 ## Testing
 
@@ -114,6 +141,7 @@ ctest --test-dir build --output-on-failure
 | Test                  | Checks                                                       |
 |-----------------------|-------------------------------------------------------------|
 | `gemm_correctness`    | The naive matmul against a known result                     |
+| `linear_equivalence`  | The AVX2 `linear` kernel against the scalar reference        |
 | `loader_roundtrip`    | The binary loader and tokenizer decode on generated fixtures |
 | `kv_cache_equivalence`| Cached and uncached generation produce identical tokens      |
 
@@ -154,7 +182,8 @@ inference-engine/
 │   ├── tokenizer.{cpp,hpp}  # byte-level BPE (decode implemented, encode pending)
 │   ├── forward.{cpp,hpp}    # forward pass, cached and uncached
 │   ├── kv_cache.hpp         # per-layer key/value cache
-│   ├── gemm.{cpp,hpp}       # matmul and linear kernels
+│   ├── gemm.{cpp,hpp}       # linear/matmul kernels (scalar + AVX2 + OpenMP)
+│   ├── profile.hpp          # zero-overhead RAII wall-clock profiler (IE_PROFILE)
 │   ├── quant.{cpp,hpp}      # int8 quantization (scaffolding)
 │   └── npy.hpp              # minimal .npy reader/writer for the harness
 ├── tools/
@@ -164,6 +193,7 @@ inference-engine/
 │   └── format_spec.py       # shared on-disk format definitions
 ├── tests/
 │   ├── test_gemm.cpp        # matmul unit test
+│   ├── test_linear.cpp      # AVX2 vs scalar linear-kernel equivalence
 │   ├── test_loader.cpp      # loader and decode test
 │   ├── test_kv_cache.cpp    # cached vs uncached equivalence
 │   ├── make_fixtures.py     # cross-language fixtures
@@ -171,6 +201,7 @@ inference-engine/
 │   └── check_argmax.py      # greedy-token match against reference
 ├── CMakeLists.txt
 ├── Makefile
+├── BENCH.md
 └── .github/workflows/ci.yml
 ```
 
@@ -180,7 +211,7 @@ inference-engine/
 - [x] Phase 1: weight export and BPE decode
 - [x] Phase 2: forward pass and greedy generation, verified against the reference
 - [x] Phase 3: KV cache
-- [ ] Phase 4: GEMM optimization (AVX2, multithreading, cache tiling)
+- [x] Phase 4: GEMM optimization (AVX2 SIMD, multithreaded over output features)
 - [ ] Phase 5: int8 and int4 quantization
 - [ ] Phase 6: port to a ~1B Llama model (RoPE, SwiGLU, GQA, RMSNorm) and benchmark against llama.cpp
 
