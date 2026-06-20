@@ -106,6 +106,13 @@ if(IE_BUILD_TESTS)
     target_link_libraries(test_linear PRIVATE ie_core)
     add_test(NAME linear_equivalence COMMAND test_linear)
 
+    # Quantized kernels (Phase 5). Hermetic: random weights quantized in memory,
+    # AVX2 q8/q4 checked against scalar refs + a dequant cross-check + a bounded
+    # accuracy check. No real weights or Python required.
+    add_executable(test_quant tests/test_quant.cpp)
+    target_link_libraries(test_quant PRIVATE ie_core)
+    add_test(NAME quant_equivalence COMMAND test_quant)
+
     # KV-cache equivalence (Phase 3). Hermetic: builds a tiny model with small
     # deterministic weights in memory and proves cached and uncached generation
     # pick the same token at every step. No real weights or Python required.

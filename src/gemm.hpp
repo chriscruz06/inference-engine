@@ -1,6 +1,8 @@
 // src/gemm.hpp
 #pragma once
 
+#include "quant.hpp"
+
 namespace ie {
 
 // Matrix-multiply kernels. The entire performance story of this project lives
@@ -34,6 +36,36 @@ void linear_avx2(const float* x, const float* w, const float* bias, float* y, in
                  int out_dim);
 #endif
 
+// ---- Phase 5: weight-only quantized linear (y = x * dequant(W)^T + bias) ----
+// Same math as linear(), but W is a group-wise quantized QuantTensor [out, in].
+// Activations x stay fp32; the kernel dequantizes each weight group on the fly
+// (int8/int4 -> fp32) so it streams 1/4 or 1/8 the weight bytes per token -- the
+// decode (GEMV, memory-bandwidth-bound) win. Dims come from the tensor. `bias`
+// may be null. The *_scalar kernels are the always-available correctness
+// reference for tests/test_quant.cpp; the *_avx2 kernels are the fast path.
+void linear_q8_scalar(const float* x, const QuantTensor& w, const float* bias, float* y, int rows);
+void linear_q4_scalar(const float* x, const QuantTensor& w, const float* bias, float* y, int rows);
+
+#if defined(__AVX2__) && defined(__FMA__)
+void linear_q8_avx2(const float* x, const QuantTensor& w, const float* bias, float* y, int rows);
+void linear_q4_avx2(const float* x, const QuantTensor& w, const float* bias, float* y, int rows);
+#endif
+
+// A linear weight, either fp32 (a raw row-major [out, in] buffer) or a quantized
+// QuantTensor. Lets the forward pass select the kernel per weight without knowing
+// which it is: exactly one of `f32` / `q` is non-null. in_dim/out_dim are always
+// set (they mirror the QuantTensor's dims in the quantized case).
+struct LinearWeight {
+    const float* f32 = nullptr;
+    const QuantTensor* q = nullptr;
+    int in_dim = 0;
+    int out_dim = 0;
+};
+
+// Dispatch over a LinearWeight: fp32 -> linear_avx2/scalar, quantized -> the
+// matching q8/q4 kernel. y is [rows, out_dim]. One profiler scope per call.
+void linear(const float* x, const LinearWeight& w, const float* bias, float* y, int rows);
+
 // Phase 4 GEMM optimization ends here. linear_avx2 above is the 8-wide FMA
 // kernel parallelized over output features (OpenMP, gated by work size so
 // decode's per-token GEMVs stay serial). Cache-blocking the prefill GEMM over
@@ -45,6 +77,7 @@ void linear_avx2(const float* x, const float* w, const float* bias, float* y, in
 // scaling gap is shared-L3 bandwidth and all-core throttling, which blocking
 // cannot touch. Decode's wall is memory bandwidth, addressed in Phase 5.
 //
-// Next (Phase 5): weight-only quantization, int8 then int4, in quant.{hpp,cpp}.
+// Phase 5 attacks that wall with the quantized linear kernels above (int8/int4
+// weights, fp32 activations): fewer weight bytes streamed per decode token.
 
 }  // namespace ie
