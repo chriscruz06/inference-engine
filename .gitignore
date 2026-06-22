@@ -7,11 +7,16 @@ cmake-build-*/
 *.dylib
 compile_commands.json
 
+# Claude Code working context (local only)
+CLAUDE.md
+
 # Model weights & activation dumps (large; regenerate with tools/)
 models/*
 !models/.gitkeep
 tests/reference_dumps/
 tests/engine_dumps/
+tests/reference_dumps_llama/
+tests/engine_dumps_llama/
 
 # Python
 __pycache__/

@@ -4,18 +4,19 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 
-`inference-engine` is a CPU language-model inference engine written in C++ with no machine-learning or math-library dependencies. It reads GPT-2 124M weights from disk, runs the full transformer forward pass directly, and generates text with greedy decoding and a KV cache. The standard library and, optionally, OpenMP are the only libraries linked. It provides a readable, framework-free implementation of transformer inference at the level of memory and arithmetic.
+`inference-engine` is a CPU language-model inference engine written in C++ with no machine-learning or math-library dependencies. It reads GPT-2 124M or TinyLlama 1.1B weights from disk, runs the full transformer forward pass directly, and generates text with greedy decoding and a KV cache. The standard library and, optionally, OpenMP are the only libraries linked. It provides a readable, framework-free implementation of transformer inference at the level of memory and arithmetic.
 
-> Status: the weight loader, byte-level BPE decoding, the GPT-2 124M forward pass, KV-cached greedy generation, an AVX2-vectorized multithreaded GEMM, and weight-only int8/int4 quantization are implemented and tested. The forward pass matches a HuggingFace GPT-2 reference token-for-token on the reference prompt; int8 quantization is near-lossless and speeds up decode. BPE encoding and the Llama port are not yet implemented.
+> Status: the weight loader, the GPT-2 124M and TinyLlama 1.1B forward passes, KV-cached greedy generation, an AVX2-vectorized multithreaded GEMM, and weight-only int8/int4 quantization are implemented and tested. Both forward passes match their HuggingFace reference token-for-token on the reference prompt. The Llama port adds RMSNorm, rotary position embeddings, grouped-query attention, a SwiGLU MLP, and SentencePiece decoding; int8 quantization is near-lossless and speeds up decode on both models. The remaining Phase 6 step is the throughput comparison against llama.cpp. Encoding (BPE and SentencePiece) is not yet implemented, so prompts are supplied as token ids.
 
 ## Features
 
-- Loads GPT-2 124M from a flat binary produced by the included Python exporter.
+- Loads GPT-2 124M or TinyLlama 1.1B from a flat binary produced by the included Python exporter; the architecture is selected by the file's magic.
 - Implements the full transformer forward pass by hand: token and learned position embeddings, pre-LayerNorm blocks, multi-head causal self-attention, a tanh-approximation GELU MLP, and a tied language-model head.
+- Adds the Llama-2 architecture for the TinyLlama port: RMSNorm, rotary position embeddings (the rotate-half convention), grouped-query attention with a narrowed KV cache, a SwiGLU MLP, and an untied language-model head, all behind the same forward and KV-cached entry points selected by an architecture flag.
 - Optimizes the single `linear` kernel that serves both compute regimes: an AVX2 path (8-wide FMA with four accumulators) parallelized across cores with OpenMP over output features, gated by work size so the bandwidth-bound decode GEMV stays single-threaded.
 - Adds optional weight-only quantization (group-wise symmetric int8 and packed int4): the matmul weights are quantized in memory and the kernel dequantizes each group on the fly, shrinking the per-token weight stream that bounds decode.
 - Provides a KV cache for incremental decoding, so per-token cost is independent of sequence length rather than quadratic.
-- Decodes byte-level BPE token ids to text using the GPT-2 byte-to-unicode mapping. Encoding is not yet implemented.
+- Decodes token ids to text for both tokenizers: byte-level BPE (GPT-2's byte-to-unicode mapping) and SentencePiece (Llama). Encoding is not yet implemented; prompts are supplied as token ids.
 - Generates text with greedy (argmax) sampling and streams each token as it is produced.
 - Includes a reference-diffing harness that dumps every intermediate activation and compares it against a HuggingFace reference.
 - Links no PyTorch and no BLAS; uses only the C++17 standard library and optional OpenMP.
@@ -24,6 +25,8 @@
 ## How it works
 
 The forward pass repeats a single transformer block. Each block applies LayerNorm, multi-head causal self-attention, a second LayerNorm, and a two-layer MLP with a tanh-approximation GELU activation, with residual connections around the attention and MLP sublayers. GPT-2 uses learned absolute position embeddings, pre-LayerNorm placement, and a token embedding matrix tied to the output projection. A final LayerNorm precedes the language-model head.
+
+The TinyLlama port swaps these GPT-2 specifics for the Llama-2 block: RMSNorm in place of LayerNorm, rotary position embeddings in place of learned ones, grouped-query attention (fewer key/value heads than query heads, which narrows the cache), a SwiGLU MLP, and an untied head. A dispatch on the loaded model's architecture selects the block; the `linear` kernel, the cache, and the verification harness are shared across both.
 
 Two compute regimes appear during generation:
 
@@ -67,17 +70,33 @@ Weight-only group-wise quantization shrinks the per-token weight stream that bou
 | int8 (group 64) |         46.6 |     3.76x |               95.8% |
 | int4 (group 16) |         21.4 |     5.33x |               64.6% |
 
-int8 lifts decode about 29% and is near-lossless (95.8% of greedy tokens match fp32, mean per-logit error 1.2). int4 shrinks the footprint further and stays coherent at a group of 16, but decode is *slower* than fp32 here: the nibble-unpack costs more ALU than an int8 load, and the finer group that int4 needs for coherence forces more per-group rescales than the bandwidth it saves on a model this small. int4's speed payoff is expected on the larger Llama port, where decode is more bandwidth-starved. The full accuracy and speed sweep (and the int4 negative result) is in [BENCH.md](BENCH.md).
+int8 lifts decode about 29% and is near-lossless (95.8% of greedy tokens match fp32, mean per-logit error 1.2). int4 shrinks the footprint further and stays coherent at a group of 16, but decode is *slower* than fp32 here: the nibble-unpack costs more ALU than an int8 load, and the finer group that int4 needs for coherence forces more per-group rescales than the bandwidth it saves on a model this small. On the larger TinyLlama port int4 becomes far more accurate (token-identical to fp32 even at a group of 64), but its decode is still not faster than fp32, so the int4 speed result holds at 1B (see below). The full accuracy and speed sweep (and the int4 negative result) is in [BENCH.md](BENCH.md).
 
 ```bash
 ./build/inference-engine --model models/gpt2-124m.bin --tokens 30 --quant q8        # generate (int8)
 ./build/inference-engine --model models/gpt2-124m.bin --compare-quant --quant q8    # accuracy vs fp32
 ```
 
+### TinyLlama 1.1B (Phase 6)
+
+The Llama port runs the same kernels on a model about nine times larger. Same session, prefill 128 and decode 64:
+
+| Weights         | Prefill tok/s | Decode tok/s | Footprint | Token match vs fp32 |
+|-----------------|--------------:|-------------:|----------:|--------------------:|
+| fp32            |          43.6 |          5.4 |        1x |                   - |
+| int8 (group 64) |          40.6 |          8.1 |     3.76x |                100% |
+| int4 (group 64) |          29.5 |          5.1 |     7.11x |                100% |
+
+int8 is again the decode win, and a larger one than on GPT-2: about +50% (5.4 to 8.1 tok/s), near-lossless, because a TinyLlama decode step streams roughly nine times the weight bytes and is more bandwidth-starved. int4 becomes dramatically more accurate at scale (token-identical to fp32 even at a group of 64, where GPT-2 needed a group of 16 and still diverged), giving a 7.11x footprint, but its decode is still not faster than fp32: the nibble-unpack ALU stays the wall even on a 1B model. So int8 is the all-around decode win and int4 is the footprint/accuracy choice. Full numbers in [BENCH.md](BENCH.md).
+
+```bash
+./build/inference-engine --model models/tinyllama-1.1b.bin --tokens 30 --quant q8
+```
+
 ## Requirements
 
 - A C++17 compiler and CMake 3.16 or newer. OpenMP is used if present.
-- Python 3 with the packages in `requirements.txt` (`numpy`, `torch`, `transformers`) for weight export, reference dumps, and the diff scripts. The engine itself has no runtime dependencies.
+- Python 3 with the packages in `requirements.txt` (`numpy`, `torch`, `transformers`, and `sentencepiece` for the Llama tokenizer) for weight export, reference dumps, and the diff scripts. The engine itself has no runtime dependencies.
 
 ## Build
 
@@ -117,6 +136,10 @@ The weights and tokenizer are not committed. Export them once with the Python to
 python -m pip install -r requirements.txt
 python tools/export_weights.py   --model gpt2  --out models/gpt2-124m.bin
 python tools/convert_tokenizer.py --from-hf gpt2 --out models/tokenizer.bin
+
+# TinyLlama 1.1B (Llama-2 architecture, SentencePiece tokenizer)
+python tools/export_weights.py    --arch llama --out models/tinyllama-1.1b.bin
+python tools/convert_tokenizer.py --arch llama --out models/tokenizer-llama.bin
 ```
 
 ### Generate text
@@ -129,7 +152,18 @@ python tools/convert_tokenizer.py --from-hf gpt2 --out models/tokenizer.bin
 The quick brown foxes are a great way to get a little bit of a kick out of your dog.
 ```
 
-The BPE encoder is not implemented, so the prompt is supplied as token ids through `--input-ids` (which defaults to the reference prompt) rather than through `--prompt`. Generation uses the KV cache by default.
+TinyLlama generates the same way; the tokenizer matching the model is selected automatically.
+
+```bash
+./build/inference-engine --model models/tinyllama-1.1b.bin \
+    --input-ids tests/reference_dumps_llama/input_ids.npy --tokens 20
+```
+
+```
+The quick brown fox jumps over the lazy dog.
+```
+
+Encoding is not implemented, so the prompt is supplied as token ids through `--input-ids` rather than `--prompt`. The default points at the GPT-2 reference prompt; the Llama prompt ids come from `tools/reference.py --arch llama`, which writes `tests/reference_dumps_llama/input_ids.npy`. Generation uses the KV cache by default and stops at the end-of-sequence token.
 
 ### Command-line options
 
@@ -137,13 +171,13 @@ The BPE encoder is not implemented, so the prompt is supplied as token ids throu
 |--------------------|----------------------------------------|--------------------------------------------------------------|
 | `--model <path>`   | required                               | Model binary from `tools/export_weights.py`                  |
 | `--tokens <N>`     | `64`                                   | Number of tokens to generate                                 |
-| `--tokenizer <path>` | `models/tokenizer.bin`               | Tokenizer binary used to decode output; falls back to raw ids |
+| `--tokenizer <path>` | matches the model                    | Tokenizer binary used to decode output (GPT-2 or Llama, per model); falls back to raw ids |
 | `--input-ids <path>` | `tests/reference_dumps/input_ids.npy` | Prompt token ids, used in place of `--prompt`               |
 | `--prompt <text>`  | `"The quick brown fox"`                | Currently ignored; `encode()` is not implemented             |
 | `--check-cache`    |                                        | Compare cached and uncached generation, then exit            |
 | `--bench`          |                                        | Benchmark prefill and decode tok/s separately, then exit     |
 | `--quant <mode>`   | `none`                                 | Weight-only quantization for the matmuls: `none`, `q8`, `q4` |
-| `--quant-group <N>`| q8 `64`, q4 `16`                       | Weights per shared scale; finer trades footprint for accuracy |
+| `--quant-group <N>`| q8 `64`; q4 `16` (GPT-2) / `64` (Llama) | Weights per shared scale; finer trades footprint for accuracy |
 | `--compare-quant`  |                                        | Report quantized-vs-fp32 token match, divergence, logit error, then exit |
 | `-h`, `--help`     |                                        | Print usage and exit                                         |
 
@@ -200,17 +234,17 @@ The equivalent check on a small in-memory model runs as part of the test suite (
 inference-engine/
 ├── src/
 │   ├── main.cpp             # CLI, generation loop, verification and cache-check modes
-│   ├── model.{cpp,hpp}      # config and weight loading
-│   ├── tokenizer.{cpp,hpp}  # byte-level BPE (decode implemented, encode pending)
-│   ├── forward.{cpp,hpp}    # forward pass, cached and uncached
+│   ├── model.{cpp,hpp}      # config and weight loading (GPT-2 and Llama formats)
+│   ├── tokenizer.{cpp,hpp}  # byte-level BPE and SentencePiece decode (encode pending)
+│   ├── forward.{cpp,hpp}    # forward pass for GPT-2 and Llama, cached and uncached
 │   ├── kv_cache.hpp         # per-layer key/value cache
 │   ├── gemm.{cpp,hpp}       # linear/matmul kernels (scalar + AVX2 + OpenMP)
 │   ├── profile.hpp          # zero-overhead RAII wall-clock profiler (IE_PROFILE)
 │   ├── quant.{cpp,hpp}      # group-wise int8/int4 weight quantization
 │   └── npy.hpp              # minimal .npy reader/writer for the harness
 ├── tools/
-│   ├── export_weights.py    # HF weights to flat binary
-│   ├── convert_tokenizer.py # HF vocab and merges to tokenizer binary
+│   ├── export_weights.py    # HF weights to flat binary (GPT-2 or Llama)
+│   ├── convert_tokenizer.py # HF vocab/merges or SentencePiece to tokenizer binary
 │   ├── reference.py         # dump reference activations
 │   └── format_spec.py       # shared on-disk format definitions
 ├── tests/
@@ -236,7 +270,8 @@ inference-engine/
 - [x] Phase 3: KV cache
 - [x] Phase 4: GEMM optimization (AVX2 SIMD, multithreaded over output features)
 - [x] Phase 5: weight-only int8 and int4 quantization (int8 the decode win; int4 tradeoffs documented)
-- [ ] Phase 6: port to a ~1B Llama model (RoPE, SwiGLU, GQA, RMSNorm) and benchmark against llama.cpp
+- [x] Phase 6: TinyLlama 1.1B port (RMSNorm, RoPE, GQA, SwiGLU, untied head, SentencePiece decode, int8/int4), verified token-for-token against HuggingFace
+- [ ] Phase 6 (cont.): throughput comparison against llama.cpp on the same model and hardware
 
 ## References
 

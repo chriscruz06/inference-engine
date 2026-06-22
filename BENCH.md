@@ -74,3 +74,57 @@ Sample continuations (30 tokens, prompt "The quick brown fox"):
 - The `--bench` checksum changes under quantization (2238.66 -> 1201.89 int8 ->
   135315.56 int4), confirming the quantized kernels actually run.
 
+## Phase 6: quantization on TinyLlama 1.1B (the Llama port)
+
+Same weight-only group-wise scheme, now over Llama's seven streamed matmuls
+(q/k/v/o + gate/up/down) plus the untied lm_head, routed through the same
+`LinearWeight` dispatch. This is the bigger, more bandwidth-starved model the
+Phase 5 GPT-2 int4 negative result said to re-measure on.
+
+All numbers same session (A/B-valid), TinyLlama 1.1B, prefill=128 decode=64,
+median of 3 (+1 warmup), same machine as above. fp32 is the control.
+
+### Speed (tok/s)
+
+| Kernel | Group | Prefill tok/s | Decode tok/s | Decode ms/tok | vs fp32 decode |
+|--------|------:|--------------:|-------------:|--------------:|---------------:|
+| fp32   |     - |          43.6 |          5.4 |         185.8 |          1.00x |
+| **int8**|    64 |          40.6 |      **8.1** |         123.6 |      **1.50x** |
+| int4   |    64 |          29.5 |          5.1 |         196.2 |          0.94x |
+
+### Footprint and accuracy
+
+Footprint is the quantized matmul weights vs the fp32 size of the same matrices.
+Accuracy from `--compare-quant` (32 teacher-forced steps on "The quick brown fox").
+
+| Kernel | Group | Footprint        | Token match vs fp32 | Mean per-logit err | Coherent? |
+|--------|------:|-----------------:|--------------------:|-------------------:|-----------|
+| int8   |    64 | 1099.1 MB (3.76x)|           **100%**  |              0.038 | yes (~fp32) |
+| int4   |    64 |  581.9 MB (7.11x)|           **100%**  |              0.646 | yes |
+| int4   |    32 |  646.5 MB (6.40x)|             100%    |                  - | yes |
+| int4   |    16 |  775.8 MB (5.33x)|             100%    |              0.481 | yes |
+
+### Read
+
+- **int8 is the decode win, and a bigger one than on GPT-2:** +50% decode
+  (5.4 -> 8.1 tok/s) vs GPT-2's +29%, near-lossless (100% token match over 32
+  steps, mean logit error 0.038), 3.76x smaller. A TinyLlama decode step streams
+  ~9x the weight bytes of GPT-2's, so it is more bandwidth-starved, and cutting the
+  stream to 1 byte/weight pays off more. Prefill dips ~7% (compute-bound; the
+  int8 -> fp32 conversion is added ALU with no bandwidth to recover).
+
+- **int4: the accuracy prediction flipped, the speed prediction did not.**
+  Phase 5 predicted the 1B model would be (a) more quantization-tolerant and (b)
+  bandwidth-starved enough for int4 to finally beat fp32 on decode. (a) is
+  emphatically true: int4 stays *token-identical* to fp32 even at group 64 (100%
+  match, 7.11x footprint), where GPT-2 124M needed group 16 and still only matched
+  64.6% (groups 32/64 collapsed into repetition there). But (b) is false here:
+  int4 group-64 decode (5.1 tok/s) is still ~fp32 and well below int8 (8.1),
+  despite streaming half of int8's bytes (581.9 vs 1099.1 MB). The nibble-unpack
+  ALU is still the wall even on a 1B decode -- the same Phase 5 lesson, now
+  confirmed at 1B: a smaller weight stream only buys throughput while the path
+  stays bandwidth-bound, and int4's per-weight unpack cost crosses back over into
+  ALU-bound before its bandwidth win lands. So int4 is the footprint/accuracy
+  choice (7.11x, coherent), int8 is the all-around decode win. (Hence int4's
+  auto-group default is now 64 on Llama vs 16 on GPT-2.)
+
