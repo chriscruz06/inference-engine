@@ -30,7 +30,7 @@ namespace ie {
 struct KVCache {
     int n_layers = 0;
     int n_ctx = 0;
-    int d = 0;  // KV-head width = ModelConfig::kv_dim()
+    int d = 0;    // KV-head width = ModelConfig::kv_dim()
     int len = 0;  // positions currently filled, in [0, n_ctx]
 
     std::vector<float> k;  // [n_layers, n_ctx, d]

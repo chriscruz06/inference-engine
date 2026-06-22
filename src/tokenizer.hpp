@@ -39,7 +39,8 @@ class Tokenizer {
    private:
     void build_byte_maps();
 
-    std::vector<std::string> id_to_token_;  // id -> token string (TOK1: mapped space; TOK2: emit bytes)
+    std::vector<std::string>
+        id_to_token_;  // id -> token string (TOK1: mapped space; TOK2: emit bytes)
     std::vector<std::pair<std::string, std::string>> merges_;  // rank-ordered (for encode)
 
     bool sp_ = false;                // true when loaded from a SentencePiece (TOK2) tokenizer

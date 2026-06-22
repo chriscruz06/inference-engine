@@ -188,8 +188,8 @@ static void silu(float* x, int n) {
 static std::vector<float> rope_inv_freq(int head_dim, float theta) {
     std::vector<float> f(static_cast<std::size_t>(head_dim / 2));
     for (int i = 0; i < head_dim / 2; ++i)
-        f[static_cast<std::size_t>(i)] = static_cast<float>(
-            1.0 / std::pow(static_cast<double>(theta), (2.0 * i) / head_dim));
+        f[static_cast<std::size_t>(i)] =
+            static_cast<float>(1.0 / std::pow(static_cast<double>(theta), (2.0 * i) / head_dim));
     return f;
 }
 
@@ -575,8 +575,7 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
 
 std::vector<float> forward_cached(const Model& model, KVCache& cache,
                                   const std::vector<int>& tokens, int n_past) {
-    if (model.config.arch == Arch::Llama)
-        return forward_llama_cached(model, cache, tokens, n_past);
+    if (model.config.arch == Arch::Llama) return forward_llama_cached(model, cache, tokens, n_past);
     const ModelConfig& c = model.config;
     const int n_new = static_cast<int>(tokens.size());
     const int d = c.d_model;

@@ -149,8 +149,7 @@ bool load_llama(std::ifstream& in, Model& out) {
     const std::size_t V = static_cast<std::size_t>(vocab_size);
     const std::size_t D = static_cast<std::size_t>(d_model);
     const std::size_t M = static_cast<std::size_t>(d_mlp);
-    const std::size_t QD =
-        static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+    const std::size_t QD = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
     const std::size_t KV =
         static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
 

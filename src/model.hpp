@@ -51,10 +51,10 @@ struct LayerWeights {
 // Attention is GQA: q is [n_heads*head_dim, d], k/v are [n_kv_heads*head_dim, d]
 // (narrower), o is [d, n_heads*head_dim]. MLP is SwiGLU (gate/up/down).
 struct LlamaLayerWeights {
-    std::size_t input_ln_w = 0;                  // RMSNorm before attention
-    std::size_t q_w = 0, k_w = 0, v_w = 0;       // [q_dim,d], [kv_dim,d], [kv_dim,d]
-    std::size_t o_w = 0;                         // [d, q_dim]
-    std::size_t post_attn_ln_w = 0;              // RMSNorm before MLP
+    std::size_t input_ln_w = 0;                    // RMSNorm before attention
+    std::size_t q_w = 0, k_w = 0, v_w = 0;         // [q_dim,d], [kv_dim,d], [kv_dim,d]
+    std::size_t o_w = 0;                           // [d, q_dim]
+    std::size_t post_attn_ln_w = 0;                // RMSNorm before MLP
     std::size_t gate_w = 0, up_w = 0, down_w = 0;  // [d_mlp,d], [d_mlp,d], [d,d_mlp]
 };
 
@@ -62,12 +62,12 @@ struct LlamaLayerWeights {
 // forward pass can index tensors without re-deriving any layout. Only the set
 // matching config.arch is populated.
 struct Weights {
-    std::size_t wte = 0;  // [vocab, d]; GPT-2: tied LM head. Llama: token embedding.
-    std::size_t wpe = 0;  // [n_ctx, d] (GPT-2 only; Llama uses RoPE)
-    std::vector<LayerWeights> layers;             // GPT-2 blocks
+    std::size_t wte = 0;               // [vocab, d]; GPT-2: tied LM head. Llama: token embedding.
+    std::size_t wpe = 0;               // [n_ctx, d] (GPT-2 only; Llama uses RoPE)
+    std::vector<LayerWeights> layers;  // GPT-2 blocks
     std::vector<LlamaLayerWeights> llama_layers;  // Llama blocks
-    std::size_t ln_f_w = 0, ln_f_b = 0;  // final norm (Llama uses ln_f_w only, RMSNorm)
-    std::size_t lm_head = 0;             // output projection [vocab, d]; == wte when tied
+    std::size_t ln_f_w = 0, ln_f_b = 0;           // final norm (Llama uses ln_f_w only, RMSNorm)
+    std::size_t lm_head = 0;                      // output projection [vocab, d]; == wte when tied
 };
 
 // Quantized copies of one block's four streamed matmul weights (Phase 5). Empty
