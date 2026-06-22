@@ -272,6 +272,7 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::string prompt = "The quick brown fox";
     std::string tokenizer_path = "models/tokenizer.bin";
+    bool tokenizer_explicit = false;  // did the user pass --tokenizer?
     std::string input_ids_path = "tests/reference_dumps/input_ids.npy";
     int n_tokens = 64;
     bool check_cache = false;
@@ -301,6 +302,7 @@ int main(int argc, char** argv) {
             n_tokens = std::atoi(take_value("--tokens"));
         } else if (std::strcmp(arg, "--tokenizer") == 0) {
             tokenizer_path = take_value("--tokenizer");
+            tokenizer_explicit = true;
         } else if (std::strcmp(arg, "--input-ids") == 0) {
             input_ids_path = take_value("--input-ids");
         } else if (std::strcmp(arg, "--check-cache") == 0) {
@@ -348,6 +350,12 @@ int main(int argc, char** argv) {
     std::printf("[model] loaded '%s': %d layers, d_model=%d, vocab=%d\n", model_path.c_str(),
                 model.config.n_layers, model.config.d_model, model.config.vocab_size);
 
+    // Pick the matching tokenizer for the architecture unless one was given. The
+    // GPT-2 (TOK1) and Llama SentencePiece (TOK2) vocabularies are different files.
+    if (model.config.arch == ie::Arch::Llama && !tokenizer_explicit) {
+        tokenizer_path = "models/tokenizer-llama.bin";
+    }
+
     // --- Quantization (Phase 5) --------------------------------------------
     // Resolve --quant and (unless we are comparing, which quantizes itself) build
     // the int8/int4 weights in memory so --bench and generation use the quantized
@@ -366,13 +374,15 @@ int main(int argc, char** argv) {
                      quant_mode.c_str());
         return 2;
     }
-    // Group size: explicit --quant-group wins; otherwise int4 uses a much finer
-    // group (16) than int8 (64). int4's 16 code levels are coarse enough that on a
-    // small, quantization-sensitive model like GPT-2 124M, groups of 32/64
-    // collapse into repetition; group 16 is the coherence floor here (measured via
-    // --compare-quant, logged in BENCH.md).
+    // Group size: explicit --quant-group wins; otherwise int8 uses kQuantGroup
+    // (64). int4's coherence floor is model-dependent: GPT-2 124M needs a fine
+    // group (16) -- 32/64 collapse into repetition -- but TinyLlama 1.1B stays
+    // token-identical to fp32 even at group 64 (measured via --compare-quant; the
+    // larger model is far more quantization-tolerant). So int4 defaults to 16 on
+    // GPT-2 and kQuantGroup on Llama. Both are in BENCH.md.
+    const int q4_default = (model.config.arch == ie::Arch::Llama) ? ie::kQuantGroup : 16;
     const int group =
-        quant_group > 0 ? quant_group : (qtype == ie::QuantType::Q4 ? 16 : ie::kQuantGroup);
+        quant_group > 0 ? quant_group : (qtype == ie::QuantType::Q4 ? q4_default : ie::kQuantGroup);
     if (want_quant && !compare_quant) {
         std::size_t f32_bytes = 0;
         const std::size_t q_bytes = ie::quantize_model(model, qtype, group, &f32_bytes);
@@ -500,6 +510,7 @@ int main(int argc, char** argv) {
 
     for (int step = 0; step < n_tokens; ++step) {
         const int next = argmax(logits);
+        if (have_tok && tok.eos_id() >= 0 && next == tok.eos_id()) break;  // stop at </s>
         ids.push_back(next);
 
         if (have_tok) {

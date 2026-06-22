@@ -4,7 +4,6 @@
 numpy>=1.24
 torch>=2.0
 transformers>=4.30
+sentencepiece>=0.1.99   # TinyLlama 1.1B SentencePiece tokenizer (convert_tokenizer.py --arch llama)
 
-# For the Llama port (weeks 9-10), uncomment the tokenizer you need:
-# sentencepiece>=0.1.99   # TinyLlama 1.1B (.model tokenizer)
-# tiktoken>=0.5           # Llama 3.2 1B (tiktoken-style BPE)
+# tiktoken>=0.5         # only needed for a tiktoken-style tokenizer (e.g. Llama 3.2)

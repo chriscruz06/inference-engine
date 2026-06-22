@@ -100,13 +100,39 @@ bool Tokenizer::load(const std::string& tokenizer_bin) {
 
     char magic[4];
     if (!read_exact(in, magic, 4)) return fail("truncated header (magic)");
-    if (std::memcmp(magic, "TOK1", 4) != 0) return fail("bad magic (expected \"TOK1\")");
+    const bool tok2 = std::memcmp(magic, "TOK2", 4) == 0;
+    if (!tok2 && std::memcmp(magic, "TOK1", 4) != 0) {
+        return fail("bad magic (expected \"TOK1\" or \"TOK2\")");
+    }
 
-    int32_t version = 0, n_vocab = 0, n_merges = 0;
-    if (!read_i32(in, version) || !read_i32(in, n_vocab) || !read_i32(in, n_merges)) {
+    int32_t version = 0;
+    if (!read_i32(in, version)) return fail("truncated header (fields)");
+    if (version != 1) return fail("unsupported tokenizer version");
+
+    if (tok2) {
+        // SentencePiece (Llama): each id stores its precomputed decode emit bytes.
+        int32_t n_vocab = 0, bos = 0, eos = 0;
+        if (!read_i32(in, n_vocab) || !read_i32(in, bos) || !read_i32(in, eos)) {
+            return fail("truncated header (fields)");
+        }
+        if (n_vocab <= 0) return fail("non-positive vocab size");
+        id_to_token_.assign(static_cast<std::size_t>(n_vocab), std::string());
+        for (int i = 0; i < n_vocab; ++i) {
+            if (!read_string(in, id_to_token_[static_cast<std::size_t>(i)])) {
+                return fail("truncated vocab strings");
+            }
+        }
+        sp_ = true;
+        bos_id_ = bos;
+        eos_id_ = eos;
+        return true;
+    }
+
+    // GPT-2 byte-level BPE.
+    int32_t n_vocab = 0, n_merges = 0;
+    if (!read_i32(in, n_vocab) || !read_i32(in, n_merges)) {
         return fail("truncated header (fields)");
     }
-    if (version != 1) return fail("unsupported tokenizer version");
     if (n_vocab <= 0) return fail("non-positive vocab size");
 
     id_to_token_.assign(static_cast<std::size_t>(n_vocab), std::string());
@@ -138,6 +164,24 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
 
 std::string Tokenizer::decode(const std::vector<int>& ids) const {
     std::string out;
+
+    if (sp_) {
+        // SentencePiece: emit bytes are precomputed per id, so just concatenate.
+        for (int id : ids) {
+            if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size()) continue;
+            out += id_to_token_[static_cast<std::size_t>(id)];
+        }
+        // SentencePiece prepends a space to the first piece; drop it once when the
+        // sequence began at BOS (matches HF LlamaTokenizer.decode). Incremental
+        // single-token decode during generation never starts with BOS, so the
+        // inter-word spaces are left intact.
+        if (!ids.empty() && ids.front() == bos_id_ && !out.empty() && out.front() == ' ') {
+            out.erase(out.begin());
+        }
+        return out;
+    }
+
+    // GPT-2 byte-level BPE: reverse the byte->unicode map back to raw bytes.
     for (int id : ids) {
         if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size()) continue;
         const std::string& tok = id_to_token_[static_cast<std::size_t>(id)];

@@ -14,6 +14,11 @@ Two ways to get the data:
 
 Usage:
     python tools/convert_tokenizer.py --from-hf gpt2 --out models/tokenizer.bin
+    python tools/convert_tokenizer.py --arch llama   # TinyLlama SentencePiece -> TOK2
+
+For --arch llama the source is a SentencePiece tokenizer.model (pulled from the
+hub by default, or --spm <path> for a local one), parsed with the sentencepiece
+library and written in the TOK2 layout (see tools/format_spec.py).
 """
 
 import argparse
@@ -85,14 +90,64 @@ def write_tokenizer(path: str, encoder: dict, merges) -> None:
     print(f"[tokenizer] wrote {path}: {n_vocab} tokens, {len(merges)} merges")
 
 
+def write_llama_tokenizer(path: str, model_file: str) -> None:
+    """Read a SentencePiece tokenizer.model and write the flat TOK2 binary.
+
+    All SentencePiece decode semantics are resolved here: the space marker U+2581
+    becomes a space, byte-fallback pieces "<0xXX>" become the raw byte, and
+    control/unknown pieces (<s>, </s>, <unk>) emit nothing. The C++ side then only
+    concatenates these per-token emit strings.
+    """
+    import sentencepiece as spm
+
+    sp = spm.SentencePieceProcessor(model_file=model_file)
+    n = sp.get_piece_size()
+    bos, eos = sp.bos_id(), sp.eos_id()
+
+    emits: list[bytes] = []
+    for i in range(n):
+        piece = sp.id_to_piece(i)
+        if sp.IsByte(i):
+            emits.append(bytes([int(piece[3:5], 16)]))  # "<0xXX>" -> byte XX
+        elif sp.IsControl(i) or sp.IsUnknown(i):
+            emits.append(b"")  # <s>, </s>, <unk> render to nothing
+        else:
+            emits.append(piece.replace("▁", " ").encode("utf-8"))
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(fs.pack_llama_tokenizer_header(n, bos, eos))
+        for b in emits:
+            fs.write_length_prefixed_bytes(f, b)
+    print(f"[tokenizer] wrote {path}: {n} pieces (bos={bos}, eos={eos})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--encoder", help="path to vocab.json / encoder.json")
-    parser.add_argument("--vocab", help="path to merges.txt / vocab.bpe")
-    parser.add_argument("--from-hf", help="HF model id to pull vocab.json + merges.txt from")
-    parser.add_argument("--out", default="models/tokenizer.bin", help="output path")
+    parser.add_argument("--arch", default="gpt2", choices=["gpt2", "llama"])
+    parser.add_argument("--encoder", help="gpt2: path to vocab.json / encoder.json")
+    parser.add_argument("--vocab", help="gpt2: path to merges.txt / vocab.bpe")
+    parser.add_argument("--from-hf", help="HF model id to pull tokenizer data from")
+    parser.add_argument("--spm", help="llama: path to a local SentencePiece tokenizer.model")
+    parser.add_argument("--out", default=None, help="output path (default: per --arch)")
     args = parser.parse_args()
 
+    if args.arch == "llama":
+        out = args.out or "models/tokenizer-llama.bin"
+        if args.spm:
+            model_file = args.spm
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError:
+                print("huggingface_hub not available; use --spm <tokenizer.model>.", file=sys.stderr)
+                return 1
+            repo = args.from_hf or "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            model_file = hf_hub_download(repo_id=repo, filename="tokenizer.model")
+        write_llama_tokenizer(out, model_file)
+        return 0
+
+    out = args.out or "models/tokenizer.bin"
     if args.from_hf:
         try:
             encoder, merges = load_from_hf(args.from_hf)
@@ -108,7 +163,7 @@ def main() -> int:
         print("provide either --from-hf, or both --encoder and --vocab", file=sys.stderr)
         return 2
 
-    write_tokenizer(args.out, encoder, merges)
+    write_tokenizer(out, encoder, merges)
     return 0
 
 
