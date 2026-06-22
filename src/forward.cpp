@@ -160,7 +160,335 @@ static void attention_kv(const float* xn, const LinearWeight& c_attn_w, const fl
     linear(context.data(), c_proj_w, c_proj_b, out, n_new);
 }
 
+// ============================================================================
+// Llama path: RMSNorm, RoPE (rotate-half), GQA attention, SwiGLU MLP. Selected
+// by config.arch; the GPT-2 functions above are untouched. forward_llama is the
+// dump oracle (mirrors forward()); forward_llama_cached is the KV-cache fast path.
+// ============================================================================
+
+// RMSNorm over the last dim: x / sqrt(mean(x^2) + eps) * weight. No mean
+// subtraction and no bias (the subtle difference from layernorm()).
+static void rmsnorm(const float* x, const float* weight, float* out, int n, float eps) {
+    float ms = 0.0f;
+    for (int i = 0; i < n; ++i) ms += x[i] * x[i];
+    ms /= static_cast<float>(n);
+    const float inv = 1.0f / std::sqrt(ms + eps);
+    for (int i = 0; i < n; ++i) out[i] = x[i] * inv * weight[i];
+}
+
+// SiLU (swish) in place: x * sigmoid(x). The SwiGLU gate activation.
+static void silu(float* x, int n) {
+    for (int i = 0; i < n; ++i) {
+        const float v = x[i];
+        x[i] = v / (1.0f + std::exp(-v));
+    }
+}
+
+// RoPE inverse frequencies: inv_freq[i] = theta^(-2i/head_dim), i in [0, hd/2).
+static std::vector<float> rope_inv_freq(int head_dim, float theta) {
+    std::vector<float> f(static_cast<std::size_t>(head_dim / 2));
+    for (int i = 0; i < head_dim / 2; ++i)
+        f[static_cast<std::size_t>(i)] = static_cast<float>(
+            1.0 / std::pow(static_cast<double>(theta), (2.0 * i) / head_dim));
+    return f;
+}
+
+// Apply rotary position embedding (HF "rotate-half") in place to one head vector
+// `v` of length hd at absolute position `pos`. The two HALVES are paired (index i
+// with i+hd/2), NOT adjacent elements -- matching HF Llama, not the interleaved
+// convention. This pairing is the classic RoPE divergence source.
+static void rope_inplace(float* v, int hd, int pos, const float* inv_freq) {
+    const int half = hd / 2;
+    for (int i = 0; i < half; ++i) {
+        const float angle = static_cast<float>(pos) * inv_freq[static_cast<std::size_t>(i)];
+        const float cs = std::cos(angle);
+        const float sn = std::sin(angle);
+        const float a = v[i];
+        const float b = v[i + half];
+        v[i] = a * cs - b * sn;
+        v[i + half] = b * cs + a * sn;
+    }
+}
+
+// Llama multi-head attention, no cache (the oracle path). GQA: query head h reads
+// KV head h/(n_heads/n_kv_heads). RoPE is applied to Q and K (not V) at each
+// token's absolute position (== t with no cache). out is [seq, d] after o_proj,
+// before the residual add (what HF's self_attn hook captures).
+static void llama_attention(const float* x, const LlamaLayerWeights& L, const Model& model,
+                            float* out, int seq, const ModelConfig& c, const float* inv_freq) {
+    const int d = c.d_model;
+    const int hd = c.head_dim;
+    const int nh = c.n_heads;
+    const int nkv = c.kv_heads();
+    const int q_dim = nh * hd;
+    const int kv_dim = nkv * hd;
+    const int group = nh / nkv;  // query heads sharing one KV head
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    std::vector<float> q(static_cast<std::size_t>(seq) * q_dim);
+    std::vector<float> k(static_cast<std::size_t>(seq) * kv_dim);
+    std::vector<float> v(static_cast<std::size_t>(seq) * kv_dim);
+    linear(x, model.at(L.q_w), nullptr, q.data(), seq, d, q_dim);
+    linear(x, model.at(L.k_w), nullptr, k.data(), seq, d, kv_dim);
+    linear(x, model.at(L.v_w), nullptr, v.data(), seq, d, kv_dim);
+
+    for (int t = 0; t < seq; ++t) {
+        float* qt = q.data() + static_cast<std::size_t>(t) * q_dim;
+        float* kt = k.data() + static_cast<std::size_t>(t) * kv_dim;
+        for (int h = 0; h < nh; ++h) rope_inplace(qt + h * hd, hd, t, inv_freq);
+        for (int g = 0; g < nkv; ++g) rope_inplace(kt + g * hd, hd, t, inv_freq);
+    }
+
+    std::vector<float> context(static_cast<std::size_t>(seq) * q_dim, 0.0f);
+    std::vector<float> scores(static_cast<std::size_t>(seq));
+    for (int h = 0; h < nh; ++h) {
+        const int g = h / group;  // KV head this query head reads
+        const int qoff = h * hd;  // Q slice within a q_dim row
+        const int koff = g * hd;  // K/V slice within a kv_dim row
+        for (int i = 0; i < seq; ++i) {
+            const float* qi = q.data() + static_cast<std::size_t>(i) * q_dim + qoff;
+            for (int j = 0; j <= i; ++j) {
+                const float* kj = k.data() + static_cast<std::size_t>(j) * kv_dim + koff;
+                float dot = 0.0f;
+                for (int e = 0; e < hd; ++e) dot += qi[e] * kj[e];
+                scores[static_cast<std::size_t>(j)] = dot * scale;
+            }
+            softmax(scores.data(), i + 1);
+            float* ctx = context.data() + static_cast<std::size_t>(i) * q_dim + qoff;
+            for (int j = 0; j <= i; ++j) {
+                const float* vj = v.data() + static_cast<std::size_t>(j) * kv_dim + koff;
+                const float a = scores[static_cast<std::size_t>(j)];
+                for (int e = 0; e < hd; ++e) ctx[e] += a * vj[e];
+            }
+        }
+    }
+    linear(context.data(), model.at(L.o_w), nullptr, out, seq, q_dim, d);
+}
+
+// Llama attention backed by the KV cache (fast path). The new tokens' K/V are
+// RoPE'd then appended at [n_past, n_past+n_new); each query attends causally over
+// cached keys 0..(n_past+i). Cache rows are kv_dim wide (GQA), KV head g at
+// columns [g*head_dim, (g+1)*head_dim). Post-RoPE keys are stored (HF caches the
+// rotated K); V is stored unrotated.
+static void llama_attention_kv(const float* xn, const LinearWeight& w_q, const LinearWeight& w_k,
+                               const LinearWeight& w_v, const LinearWeight& w_o, float* out,
+                               KVCache& cache, int layer, int n_new, int n_past,
+                               const ModelConfig& c, const float* inv_freq) {
+    const int hd = c.head_dim;
+    const int nh = c.n_heads;
+    const int nkv = c.kv_heads();
+    const int q_dim = nh * hd;
+    const int kv_dim = nkv * hd;
+    const int group = nh / nkv;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    std::vector<float> q(static_cast<std::size_t>(n_new) * q_dim);
+    std::vector<float> k(static_cast<std::size_t>(n_new) * kv_dim);
+    std::vector<float> v(static_cast<std::size_t>(n_new) * kv_dim);
+    linear(xn, w_q, nullptr, q.data(), n_new);  // fp32 or quantized per LinearWeight
+    linear(xn, w_k, nullptr, k.data(), n_new);
+    linear(xn, w_v, nullptr, v.data(), n_new);
+
+    // RoPE Q and K at the absolute position, then append K (post-RoPE) and V.
+    for (int i = 0; i < n_new; ++i) {
+        const int pos = n_past + i;
+        float* qi = q.data() + static_cast<std::size_t>(i) * q_dim;
+        float* ki = k.data() + static_cast<std::size_t>(i) * kv_dim;
+        const float* vi = v.data() + static_cast<std::size_t>(i) * kv_dim;
+        for (int h = 0; h < nh; ++h) rope_inplace(qi + h * hd, hd, pos, inv_freq);
+        for (int g = 0; g < nkv; ++g) rope_inplace(ki + g * hd, hd, pos, inv_freq);
+        std::copy(ki, ki + kv_dim, cache.k_row(layer, pos));
+        std::copy(vi, vi + kv_dim, cache.v_row(layer, pos));
+    }
+
+    std::vector<float> context(static_cast<std::size_t>(n_new) * q_dim, 0.0f);
+    std::vector<float> scores(static_cast<std::size_t>(n_past) + n_new);
+    for (int h = 0; h < nh; ++h) {
+        const int g = h / group;
+        const int qoff = h * hd;
+        const int koff = g * hd;  // KV head slice within a kv_dim cache row
+        for (int i = 0; i < n_new; ++i) {
+            const int p = n_past + i;  // absolute query position
+            const float* qi = q.data() + static_cast<std::size_t>(i) * q_dim + qoff;
+            for (int j = 0; j <= p; ++j) {
+                const float* kj = cache.k_row(layer, j) + koff;
+                float dot = 0.0f;
+                for (int e = 0; e < hd; ++e) dot += qi[e] * kj[e];
+                scores[static_cast<std::size_t>(j)] = dot * scale;
+            }
+            softmax(scores.data(), p + 1);
+            float* ctx = context.data() + static_cast<std::size_t>(i) * q_dim + qoff;
+            for (int j = 0; j <= p; ++j) {
+                const float* vj = cache.v_row(layer, j) + koff;
+                const float a = scores[static_cast<std::size_t>(j)];
+                for (int e = 0; e < hd; ++e) ctx[e] += a * vj[e];
+            }
+        }
+    }
+    linear(context.data(), w_o, nullptr, out, n_new);
+}
+
+// Llama forward (dump oracle). Mirrors forward(): recompute the whole sequence,
+// run the LM head over every position, dump activations when IE_DUMP_DIR is set.
+static std::vector<float> forward_llama(const Model& model, const std::vector<int>& tokens) {
+    const ModelConfig& c = model.config;
+    const int seq = static_cast<int>(tokens.size());
+    const int d = c.d_model;
+    const int dm = c.d_mlp;
+    const int V = c.vocab_size;
+    const char* dump_dir = std::getenv("IE_DUMP_DIR");
+    std::string dir;
+    if (dump_dir) dir = dump_dir;
+
+    const std::vector<float> inv_freq = rope_inv_freq(c.head_dim, c.rope_theta);
+
+    // ---- Embedding: tok_embed[token] only; RoPE supplies position later. ----
+    std::vector<float> x(static_cast<std::size_t>(seq) * d);
+    const float* wte = model.at(model.w.wte);
+    for (int t = 0; t < seq; ++t) {
+        const float* tok = wte + static_cast<std::size_t>(tokens[t]) * d;
+        std::copy(tok, tok + d, x.data() + static_cast<std::size_t>(t) * d);
+    }
+    if (dump_dir) npy::save_2d(dir + "/00_embed.npy", x, seq, d);
+
+    std::vector<float> ln(x.size());
+    std::vector<float> attn(x.size());
+    std::vector<float> gate(static_cast<std::size_t>(seq) * dm);
+    std::vector<float> up(static_cast<std::size_t>(seq) * dm);
+    std::vector<float> mlp(x.size());
+
+    for (int l = 0; l < c.n_layers; ++l) {
+        const LlamaLayerWeights& L = model.w.llama_layers[static_cast<std::size_t>(l)];
+        char tag[32];
+        std::snprintf(tag, sizeof(tag), "%02d_L%02d", l + 1, l);
+
+        // input RMSNorm -> attention -> residual 1.
+        for (int t = 0; t < seq; ++t)
+            rmsnorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L.input_ln_w),
+                    ln.data() + static_cast<std::size_t>(t) * d, d, c.ln_eps);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".ln_1.npy", ln, seq, d);
+
+        llama_attention(ln.data(), L, model, attn.data(), seq, c, inv_freq.data());
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".attn.npy", attn, seq, d);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += attn[i];
+
+        // post-attention RMSNorm -> SwiGLU MLP -> residual 2.
+        for (int t = 0; t < seq; ++t)
+            rmsnorm(x.data() + static_cast<std::size_t>(t) * d, model.at(L.post_attn_ln_w),
+                    ln.data() + static_cast<std::size_t>(t) * d, d, c.ln_eps);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".ln_2.npy", ln, seq, d);
+
+        linear(ln.data(), model.at(L.gate_w), nullptr, gate.data(), seq, d, dm);
+        linear(ln.data(), model.at(L.up_w), nullptr, up.data(), seq, d, dm);
+        silu(gate.data(), static_cast<int>(gate.size()));
+        for (std::size_t i = 0; i < gate.size(); ++i) gate[i] *= up[i];
+        linear(gate.data(), model.at(L.down_w), nullptr, mlp.data(), seq, dm, d);
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".mlp.npy", mlp, seq, d);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += mlp[i];
+
+        if (dump_dir) npy::save_2d(dir + "/" + tag + ".block.npy", x, seq, d);
+    }
+
+    // ---- Final RMSNorm + untied LM head over every position. ----
+    std::vector<float> lnf(x.size());
+    for (int t = 0; t < seq; ++t)
+        rmsnorm(x.data() + static_cast<std::size_t>(t) * d, model.at(model.w.ln_f_w),
+                lnf.data() + static_cast<std::size_t>(t) * d, d, c.ln_eps);
+    if (dump_dir) npy::save_2d(dir + "/zz_ln_f.npy", lnf, seq, d);
+
+    std::vector<float> logits(static_cast<std::size_t>(seq) * V);
+    linear(lnf.data(), model.at(model.w.lm_head), nullptr, logits.data(), seq, d, V);
+    if (dump_dir) npy::save_2d(dir + "/zz_logits.npy", logits, seq, V);
+
+    return std::vector<float>(logits.end() - V, logits.end());
+}
+
+// Llama cache-aware forward (fast path). Same block as forward_llama, but
+// attention reads/extends the KV cache and only the last position's logits are
+// returned. fp32 weights for now (quantization wired in a later step).
+static std::vector<float> forward_llama_cached(const Model& model, KVCache& cache,
+                                               const std::vector<int>& tokens, int n_past) {
+    const ModelConfig& c = model.config;
+    const int n_new = static_cast<int>(tokens.size());
+    const int d = c.d_model;
+    const int dm = c.d_mlp;
+    const int V = c.vocab_size;
+    assert(cache.len == n_past);
+    assert(n_past + n_new <= c.n_ctx);
+
+    const std::vector<float> inv_freq = rope_inv_freq(c.head_dim, c.rope_theta);
+
+    std::vector<float> x(static_cast<std::size_t>(n_new) * d);
+    const float* wte = model.at(model.w.wte);
+    for (int i = 0; i < n_new; ++i) {
+        const float* tok = wte + static_cast<std::size_t>(tokens[i]) * d;
+        std::copy(tok, tok + d, x.data() + static_cast<std::size_t>(i) * d);
+    }
+
+    std::vector<float> ln(x.size());
+    std::vector<float> attn(x.size());
+    std::vector<float> gate(static_cast<std::size_t>(n_new) * dm);
+    std::vector<float> up(static_cast<std::size_t>(n_new) * dm);
+    std::vector<float> mlp(x.size());
+
+    // Resolve each streamed matmul weight to fp32 or its quantized copy, like the
+    // GPT-2 cached path. When the model is not quantized this is byte-identical to
+    // using the fp32 weights directly (the QuantTensor pointer is ignored).
+    const bool Q = model.quantized;
+    const int QD = c.n_heads * c.head_dim;
+    const int KV = c.kv_heads() * c.head_dim;
+    auto LW = [&](std::size_t off, const QuantTensor* qt, int in, int out) -> LinearWeight {
+        if (Q) return LinearWeight{nullptr, qt, in, out};
+        return LinearWeight{model.at(off), nullptr, in, out};
+    };
+
+    for (int l = 0; l < c.n_layers; ++l) {
+        const LlamaLayerWeights& L = model.w.llama_layers[static_cast<std::size_t>(l)];
+        const LlamaQuantLayerWeights* ql =
+            Q ? &model.llama_qlayers[static_cast<std::size_t>(l)] : nullptr;
+
+        for (int i = 0; i < n_new; ++i)
+            rmsnorm(x.data() + static_cast<std::size_t>(i) * d, model.at(L.input_ln_w),
+                    ln.data() + static_cast<std::size_t>(i) * d, d, c.ln_eps);
+
+        const LinearWeight w_q = LW(L.q_w, ql ? &ql->q_w : nullptr, d, QD);
+        const LinearWeight w_k = LW(L.k_w, ql ? &ql->k_w : nullptr, d, KV);
+        const LinearWeight w_v = LW(L.v_w, ql ? &ql->v_w : nullptr, d, KV);
+        const LinearWeight w_o = LW(L.o_w, ql ? &ql->o_w : nullptr, QD, d);
+        llama_attention_kv(ln.data(), w_q, w_k, w_v, w_o, attn.data(), cache, l, n_new, n_past, c,
+                           inv_freq.data());
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += attn[i];
+
+        for (int i = 0; i < n_new; ++i)
+            rmsnorm(x.data() + static_cast<std::size_t>(i) * d, model.at(L.post_attn_ln_w),
+                    ln.data() + static_cast<std::size_t>(i) * d, d, c.ln_eps);
+
+        const LinearWeight w_gate = LW(L.gate_w, ql ? &ql->gate_w : nullptr, d, dm);
+        const LinearWeight w_up = LW(L.up_w, ql ? &ql->up_w : nullptr, d, dm);
+        const LinearWeight w_down = LW(L.down_w, ql ? &ql->down_w : nullptr, dm, d);
+        linear(ln.data(), w_gate, nullptr, gate.data(), n_new);
+        linear(ln.data(), w_up, nullptr, up.data(), n_new);
+        silu(gate.data(), static_cast<int>(gate.size()));
+        for (std::size_t i = 0; i < gate.size(); ++i) gate[i] *= up[i];
+        linear(gate.data(), w_down, nullptr, mlp.data(), n_new);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += mlp[i];
+    }
+
+    cache.len = n_past + n_new;
+
+    const float* x_last = x.data() + static_cast<std::size_t>(n_new - 1) * d;
+    std::vector<float> lnf(static_cast<std::size_t>(d));
+    rmsnorm(x_last, model.at(model.w.ln_f_w), lnf.data(), d, c.ln_eps);
+
+    std::vector<float> logits(static_cast<std::size_t>(V));
+    const LinearWeight head = Q ? LinearWeight{nullptr, &model.q_head, d, V}
+                                : LinearWeight{model.at(model.w.lm_head), nullptr, d, V};
+    linear(lnf.data(), head, nullptr, logits.data(), 1);
+    return logits;
+}
+
 std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
+    if (model.config.arch == Arch::Llama) return forward_llama(model, tokens);
     const ModelConfig& c = model.config;
     const int seq = static_cast<int>(tokens.size());
     const int d = c.d_model;
@@ -247,6 +575,8 @@ std::vector<float> forward(const Model& model, const std::vector<int>& tokens) {
 
 std::vector<float> forward_cached(const Model& model, KVCache& cache,
                                   const std::vector<int>& tokens, int n_past) {
+    if (model.config.arch == Arch::Llama)
+        return forward_llama_cached(model, cache, tokens, n_past);
     const ModelConfig& c = model.config;
     const int n_new = static_cast<int>(tokens.size());
     const int d = c.d_model;
