@@ -32,6 +32,33 @@ GPT-2's HuggingFace weights are Conv1D with the transposed [in, out] layout, so
 export_weights.py transposes the four projection matrices on the way out.
 
 ------------------------------------------------------------------------------
+LLAMA MODEL BINARY  (.bin produced by export_weights.py --arch llama)
+------------------------------------------------------------------------------
+A separate magic ("LLAM") and an extended header carrying the fields a Llama
+forward pass needs that the GPT-2 header lacks (n_kv_heads for GQA, rope_theta,
+RMSNorm eps, and a tied-embeddings flag). The GPT-2 reader/writer above is
+untouched; the C++ loader branches on the magic. All little-endian.
+
+  bytes 0..3   : magic, the 4 ASCII bytes "LLAM"
+  int32        : version (currently 1)
+  int32        : n_layers
+  int32        : n_heads            (query heads)
+  int32        : n_kv_heads         (key/value heads; n_heads/n_kv_heads share a KV head)
+  int32        : d_model
+  int32        : head_dim
+  int32        : n_ctx
+  int32        : vocab_size
+  int32        : d_mlp              (SwiGLU intermediate_size)
+  int32        : tied               (1 if lm_head ties tok_embed, else 0)
+  float32      : rms_norm_eps
+  float32      : rope_theta
+
+Then raw float32 tensors in the order returned by ``llama_tensor_specs(cfg)``.
+HF Llama linears are plain nn.Linear stored [out, in] already, so -- unlike
+GPT-2's Conv1D -- nothing is transposed on export. The blocks are bias-free; only
+weights are written. The lm_head tensor is written only when tied == 0.
+
+------------------------------------------------------------------------------
 TOKENIZER BINARY  (.bin produced by convert_tokenizer.py)
 ------------------------------------------------------------------------------
 All little-endian.
@@ -51,6 +78,30 @@ All little-endian.
 
 decode only needs the vocab strings plus the byte<->unicode map (rebuilt in C++
 from the same rule as Python's bytes_to_unicode). The merges are for encode.
+
+------------------------------------------------------------------------------
+LLAMA TOKENIZER BINARY  (.bin produced by convert_tokenizer.py --arch llama)
+------------------------------------------------------------------------------
+SentencePiece, not byte-level BPE, so a separate magic "TOK2". The fiddly
+SentencePiece semantics are resolved here (in Python, via the sentencepiece
+library) and each token's DECODE output is precomputed, so C++ decode is just a
+concatenation. All little-endian.
+
+  bytes 0..3   : magic, the 4 ASCII bytes "TOK2"
+  int32        : version (currently 1)
+  int32        : n_vocab
+  int32        : bos_id
+  int32        : eos_id
+  n_vocab times, in id order:
+      int32 L  : emit byte length
+      L bytes  : the token's decode output -- already with SentencePiece's space
+                 marker U+2581 turned into a space, byte-fallback pieces "<0xXX>"
+                 turned into the raw byte XX, and control/unknown pieces (<s>,
+                 </s>, <unk>) emptied. C++ decode concatenates these and strips a
+                 single leading space when the sequence began with bos_id.
+
+Decode-only for now (encode is a later task and will need the raw pieces + their
+scores, a richer format than this).
 """
 
 import struct
@@ -58,8 +109,14 @@ import struct
 MODEL_MAGIC = b"GPT2"
 MODEL_VERSION = 1
 
+LLAMA_MAGIC = b"LLAM"
+LLAMA_VERSION = 1
+
 TOKENIZER_MAGIC = b"TOK1"
 TOKENIZER_VERSION = 1
+
+LLAMA_TOKENIZER_MAGIC = b"TOK2"
+LLAMA_TOKENIZER_VERSION = 1
 
 
 def pack_model_header(cfg: dict) -> bytes:
@@ -111,6 +168,55 @@ def tensor_specs(cfg: dict):
     return specs
 
 
+def pack_llama_header(cfg: dict) -> bytes:
+    """Pack the 52-byte Llama model header from a config dict."""
+    return LLAMA_MAGIC + struct.pack(
+        "<10i2f",
+        LLAMA_VERSION,
+        cfg["n_layers"],
+        cfg["n_heads"],
+        cfg["n_kv_heads"],
+        cfg["d_model"],
+        cfg["head_dim"],
+        cfg["n_ctx"],
+        cfg["vocab_size"],
+        cfg["d_mlp"],
+        1 if cfg["tied"] else 0,
+        cfg["rms_norm_eps"],
+        cfg["rope_theta"],
+    )
+
+
+def llama_tensor_specs(cfg: dict):
+    """Ordered (name, shape) list for every tensor in the Llama model binary.
+
+    This order IS the file order and the C++ read order. Do not reorder. q/k/v/o
+    are separate (vs GPT-2's fused c_attn); k/v are narrower under GQA. The MLP is
+    SwiGLU (gate/up/down). lm_head is appended only when the head is untied.
+    """
+    v, d, m, lyr = cfg["vocab_size"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]
+    q_dim = cfg["n_heads"] * cfg["head_dim"]
+    kv_dim = cfg["n_kv_heads"] * cfg["head_dim"]
+    specs = [("tok_embed", (v, d))]
+    for i in range(lyr):
+        p = f"layers.{i}."
+        specs += [
+            (p + "input_ln.w", (d,)),
+            (p + "attn.q.w", (q_dim, d)),
+            (p + "attn.k.w", (kv_dim, d)),
+            (p + "attn.v.w", (kv_dim, d)),
+            (p + "attn.o.w", (d, q_dim)),
+            (p + "post_attn_ln.w", (d,)),
+            (p + "mlp.gate.w", (m, d)),
+            (p + "mlp.up.w", (m, d)),
+            (p + "mlp.down.w", (d, m)),
+        ]
+    specs += [("final_ln.w", (d,))]
+    if not cfg["tied"]:
+        specs += [("lm_head.w", (v, d))]
+    return specs
+
+
 def pack_tokenizer_header(n_vocab: int, n_merges: int) -> bytes:
     return TOKENIZER_MAGIC + struct.pack("<iii", TOKENIZER_VERSION, n_vocab, n_merges)
 
@@ -120,6 +226,20 @@ def write_length_prefixed(f, s: str) -> None:
     data = s.encode("utf-8")
     f.write(struct.pack("<i", len(data)))
     f.write(data)
+
+
+def pack_llama_tokenizer_header(n_vocab: int, bos_id: int, eos_id: int) -> bytes:
+    """Pack the 20-byte Llama (SentencePiece) tokenizer header."""
+    return LLAMA_TOKENIZER_MAGIC + struct.pack(
+        "<iiii", LLAMA_TOKENIZER_VERSION, n_vocab, bos_id, eos_id
+    )
+
+
+def write_length_prefixed_bytes(f, b: bytes) -> None:
+    """Write raw bytes as int32 length + bytes (a token's decode emit form, which
+    may be empty or non-UTF-8)."""
+    f.write(struct.pack("<i", len(b)))
+    f.write(b)
 
 
 def bytes_to_unicode() -> dict:

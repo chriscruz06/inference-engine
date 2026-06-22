@@ -17,19 +17,20 @@ namespace ie {
 // its K/V here, and attends over everything cached so far. That is the
 // unusable -> usable jump (gameplan Phase 3 / Week 4).
 //
-// Layout: K and V are each one flat fp32 buffer of [n_layers, n_ctx, d], so the
-// K (or V) vector for layer l at position p is a contiguous d-float row at
-// k_row(l, p) / v_row(l, p) -- the same [.., d] layout the fused QKV projection
-// already produces, with head h occupying columns [h*head_dim, (h+1)*head_dim).
+// Layout: K and V are each one flat fp32 buffer of [n_layers, n_ctx, d], where d
+// is the KV-head width (ModelConfig::kv_dim()): d_model for GPT-2's MHA, but the
+// narrower n_kv_heads*head_dim under Llama's GQA. The K (or V) vector for layer l
+// at position p is a contiguous d-float row at k_row(l, p) / v_row(l, p), with KV
+// head g occupying columns [g*head_dim, (g+1)*head_dim).
 //
 // Buffers are sized to the full context up front, so the row pointers handed to
 // attention never move as the cache fills. For GPT-2 124M that is
-// 2 * 12 * 1024 * 768 * 4 B ~= 75 MB; grouped-query attention shrinks it for the
-// Llama port (fewer KV heads => narrower rows).
+// 2 * 12 * 1024 * 768 * 4 B ~= 75 MB; GQA shrinks the rows for the Llama port
+// (TinyLlama: 4 KV heads * 64 = 256 wide, not 2048).
 struct KVCache {
     int n_layers = 0;
     int n_ctx = 0;
-    int d = 0;
+    int d = 0;  // KV-head width = ModelConfig::kv_dim()
     int len = 0;  // positions currently filled, in [0, n_ctx]
 
     std::vector<float> k;  // [n_layers, n_ctx, d]
@@ -39,7 +40,7 @@ struct KVCache {
     void init(const ModelConfig& c) {
         n_layers = c.n_layers;
         n_ctx = c.n_ctx;
-        d = c.d_model;
+        d = c.kv_dim();
         len = 0;
         const std::size_t n = static_cast<std::size_t>(n_layers) * static_cast<std::size_t>(n_ctx) *
                               static_cast<std::size_t>(d);
