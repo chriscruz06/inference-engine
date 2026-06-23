@@ -29,14 +29,17 @@ void print_usage(const char* prog) {
         "\n"
         "Options:\n"
         "  --model      <path>   Path to a model exported by tools/export_weights.py\n"
-        "  --prompt     <text>   Prompt to continue (ignored until encode() lands; the\n"
-        "                        prompt currently comes from --input-ids)\n"
+        "  --prompt     <text>   Prompt to continue. GPT-2: encoded with the byte-level\n"
+        "                        BPE tokenizer. Llama: SentencePiece encode is not\n"
+        "                        implemented, so use --input-ids instead.\n"
         "  --tokens     <N>      Number of tokens to generate (default: 64)\n"
         "  --tokenizer  <path>   tokenizer.bin from tools/convert_tokenizer.py, used to\n"
-        "                        decode output to text (default: models/tokenizer.bin).\n"
-        "                        If it can't be loaded, raw token ids are printed instead.\n"
-        "  --input-ids  <path>   Token ids fed as the prompt -- encode() is still a stub, so\n"
-        "                        the prompt is read from here for now\n"
+        "                        encode the prompt (GPT-2) and decode output (default:\n"
+        "                        models/tokenizer.bin). If it can't be loaded, raw token\n"
+        "                        ids are printed instead.\n"
+        "  --input-ids  <path>   Token ids to use as the prompt, in place of --prompt.\n"
+        "                        Required for Llama, and used by the verification harness\n"
+        "                        (the frozen reference ids)\n"
         "                        (default: tests/reference_dumps/input_ids.npy)\n"
         "  --check-cache         Greedy-decode both with and without the KV cache and verify\n"
         "                        the token sequences are identical, then exit. The Phase-3\n"
@@ -271,9 +274,11 @@ int run_compare_quant(ie::Model& model, const std::vector<int>& ids, int n, ie::
 int main(int argc, char** argv) {
     std::string model_path;
     std::string prompt = "The quick brown fox";
+    bool prompt_explicit = false;  // did the user pass --prompt?
     std::string tokenizer_path = "models/tokenizer.bin";
     bool tokenizer_explicit = false;  // did the user pass --tokenizer?
     std::string input_ids_path = "tests/reference_dumps/input_ids.npy";
+    bool input_ids_explicit = false;  // did the user pass --input-ids?
     int n_tokens = 64;
     bool check_cache = false;
     bool bench = false;
@@ -298,6 +303,7 @@ int main(int argc, char** argv) {
             model_path = take_value("--model");
         } else if (std::strcmp(arg, "--prompt") == 0) {
             prompt = take_value("--prompt");
+            prompt_explicit = true;
         } else if (std::strcmp(arg, "--tokens") == 0) {
             n_tokens = std::atoi(take_value("--tokens"));
         } else if (std::strcmp(arg, "--tokenizer") == 0) {
@@ -305,6 +311,7 @@ int main(int argc, char** argv) {
             tokenizer_explicit = true;
         } else if (std::strcmp(arg, "--input-ids") == 0) {
             input_ids_path = take_value("--input-ids");
+            input_ids_explicit = true;
         } else if (std::strcmp(arg, "--check-cache") == 0) {
             check_cache = true;
         } else if (std::strcmp(arg, "--bench") == 0) {
@@ -402,16 +409,39 @@ int main(int argc, char** argv) {
         return run_bench(model, bench_prefill, bench_decode, bench_iters);
     }
 
-    // Prompt tokens. encode() is still a stub, so the prompt is fed as reference
-    // token ids from --input-ids rather than tokenized from --prompt. Once
-    // encode() lands, this becomes `ids = tok.encode(prompt)`.
-    std::vector<int> ids = npy::load_i32_1d(input_ids_path);
+    // Tokenizer: used to encode the prompt (GPT-2) and to decode output. Loaded
+    // once here so every mode below can use it; generation warns if it is missing.
+    // (--bench returned above and needs no tokenizer.)
+    ie::Tokenizer tok;
+    const bool have_tok = tok.load(tokenizer_path);
+
+    // Resolve the prompt token ids, in priority order:
+    //   1. --input-ids given explicitly -> load those ids. Exact control, and the
+    //      verification-harness path (it must feed the frozen reference ids).
+    //   2. GPT-2 with a tokenizer + a --prompt -> encode() the text. (Llama's
+    //      SentencePiece encode is not implemented, so this is GPT-2 only.)
+    //   3. Otherwise -> the default --input-ids file, falling back to encoding the
+    //      default prompt if that file is absent and a GPT-2 tokenizer is loaded.
+    const bool can_encode = have_tok && model.config.arch == ie::Arch::GPT2;
+    std::vector<int> ids;
+    if (input_ids_explicit) {
+        ids = npy::load_i32_1d(input_ids_path);
+    } else if (can_encode && prompt_explicit) {
+        ids = tok.encode(prompt);
+        if (ids.empty()) {
+            std::fprintf(stderr, "[gen] encode produced no tokens for --prompt\n");
+            return 1;
+        }
+    } else {
+        ids = npy::load_i32_1d(input_ids_path);
+        if (ids.empty() && can_encode) ids = tok.encode(prompt);  // default prompt, last resort
+    }
     if (ids.empty()) {
-        std::fprintf(stderr, "[gen] no input ids at '%s'; run tools/reference.py first\n",
-                     input_ids_path.c_str());
+        std::fprintf(stderr,
+                     "[gen] no prompt tokens: pass --prompt (GPT-2), or --input-ids <file>, or\n"
+                     "      run tools/reference.py to write the default input_ids.npy\n");
         return 1;
     }
-    (void)prompt;  // unused until encode() is implemented
 
     const int n_ctx = model.config.n_ctx;
     if (static_cast<int>(ids.size()) >= n_ctx) {
@@ -485,8 +515,6 @@ int main(int argc, char** argv) {
     }
 
     // --- Generation mode ---------------------------------------------------
-    ie::Tokenizer tok;
-    const bool have_tok = tok.load(tokenizer_path);
     if (!have_tok) {
         std::fprintf(stderr,
                      "[gen] couldn't load tokenizer from '%s'; printing raw token ids.\n"
