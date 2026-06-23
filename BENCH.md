@@ -128,3 +128,58 @@ Accuracy from `--compare-quant` (32 teacher-forced steps on "The quick brown fox
   choice (7.11x, coherent), int8 is the all-around decode win. (Hence int4's
   auto-group default is now 64 on Llama vs 16 on GPT-2.)
 
+### Head-to-head vs llama.cpp (the Phase 6 end goal)
+
+Same machine (AMD Ryzen 7 PRO 7840U, 8 physical cores), same TinyLlama 1.1B, both
+engines at **8 threads**, prefill 128 / decode 64. llama.cpp is build 099b579
+compiled with `GGML_NATIVE=ON` (AVX2/FMA, same ISA as our `-march=native`),
+benched with `llama-bench -p 128 -n 64 -t 8`. Our engine runs with
+`OMP_NUM_THREADS=8`. The GGUF models are converted from the *same* HF checkpoint:
+F32 (matches our fp32), then `llama-quantize` to Q8_0 and Q4_0. The quant schemes
+are not identical (llama.cpp uses 32-weight blocks and its own hand-tuned
+dot-product kernels; ours are group 64 with dequant-on-the-fly), so the quant rows
+compare *engines at the same bit width*, not the same kernel.
+
+| Quant (ours / llama) | Regime  | ours tok/s | llama.cpp tok/s | gap (llama / ours) |
+|----------------------|---------|-----------:|----------------:|-------------------:|
+| fp32 / F32           | prefill |       36.9 |           128.0 |              3.5x  |
+| fp32 / F32           | decode  |        5.0 |             7.6 |          **1.5x**  |
+| int8 / Q8_0          | prefill |       36.2 |           149.2 |              4.1x  |
+| int8 / Q8_0          | decode  |        7.3 |            26.4 |              3.6x  |
+| int4 / Q4_0          | prefill |       23.8 |           220.5 |              9.3x  |
+| int4 / Q4_0          | decode  |        4.8 |            43.7 |              9.1x  |
+
+### Read
+
+- **fp32 is the apples-to-apples comparison (identical arithmetic, no quant-kernel
+  quality to confound it), and it lands in target: decode within 1.5x and prefill
+  within 3.5x of llama.cpp.** For a from-scratch engine whose entire GEMM is one
+  hand-written AVX2 kernel, matching llama.cpp's fp32 decode to 1.5x is the result
+  the project was aiming for (the gameplan's "within 2-4x is a strong result").
+  Decode is the closer regime because it is memory-bandwidth-bound: both engines
+  stream the same fp32 weights per token, so there is little room for one to pull
+  ahead. Prefill is compute-bound, where llama.cpp's better register blocking and
+  threading show through as a ~3.5x edge.
+
+- **The gap widens with quantization, and that is expected: quantized matmul is
+  llama.cpp's specialty.** Its Q8_0/Q4_0 paths are years of hand-tuned SIMD
+  dot-product kernels (block-wise integer MACs with minimal unpack overhead),
+  whereas ours dequantize each weight group to fp32 on the fly. Our int8 still
+  beats our own fp32 decode (7.3 vs 5.0) and is correct, but llama.cpp's Q8_0
+  decode (26.4) is 3.6x ahead, and its Q4_0 (43.7) is where its kernels are most
+  optimized, so int4 shows the largest gap (~9x). This matches the Phase 5/6
+  finding that our int4 is ALU-bound on the unpack: llama.cpp's kernels are exactly
+  the optimization that removes that wall.
+
+- **Honest bottom line.** The engine is competitive with llama.cpp where the
+  comparison is purely about the GEMM and the memory system (fp32, especially
+  decode), and falls behind by the width of llama.cpp's specialized quantization
+  kernels where it is not. Closing the quant gap would mean writing integer-domain
+  dot-product kernels (no per-group fp32 dequant), which is a worthwhile next
+  optimization but a different project than "hand-write the fp32 GEMM."
+
+Reproduce: convert with `llama.cpp/convert_hf_to_gguf.py <hf_dir> --outtype f32`,
+`llama-quantize` to Q8_0/Q4_0, then `llama-bench -m <gguf> -p 128 -n 64 -t 8`
+against `OMP_NUM_THREADS=8 inference-engine --bench --bench-prefill 128
+--bench-decode 64`.
+
