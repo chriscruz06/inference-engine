@@ -1,6 +1,7 @@
 #include "tokenizer.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -68,6 +69,125 @@ std::size_t utf8_next(const std::string& s, std::size_t i, uint32_t& cp) {
     return n;
 }
 
+// Encode one codepoint as UTF-8. GPT-2's mapped codepoints are all < 0x800 (two
+// bytes), but three-byte output is handled for safety.
+std::string utf8_encode(uint32_t cp) {
+    std::string s;
+    if (cp < 0x80) {
+        s.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        s.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+    return s;
+}
+
+// Character classes for the GPT-2 pre-tokenization pattern. \p{L}/\p{N} are
+// Unicode properties; ASCII is classified exactly and non-ASCII (non-space) is
+// approximated as a letter, so accented words and CJK group as one chunk
+// (matching GPT-2 for the common case; rare non-ASCII symbols/digits may split
+// differently). The byte-level BPE still encodes any bytes correctly.
+bool is_space_cp(uint32_t cp) {
+    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == '\v')
+        return true;
+    if (cp == 0x85 || cp == 0xA0 || cp == 0x1680) return true;
+    if (cp >= 0x2000 && cp <= 0x200A) return true;
+    return cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+bool is_letter_cp(uint32_t cp) {
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return true;
+    if (cp < 0x80) return false;
+    return !is_space_cp(cp);  // non-ASCII non-space -> treat as a letter
+}
+bool is_number_cp(uint32_t cp) {
+    return cp >= '0' && cp <= '9';
+}
+
+// 0 = letter, 1 = number, 2 = other (for a content codepoint).
+int class_of(uint32_t cp) {
+    if (is_letter_cp(cp)) return 0;
+    if (is_number_cp(cp)) return 1;
+    return 2;
+}
+
+// GPT-2 pre-tokenization. Splits `s` into byte ranges [start,end) following
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+// as a hand-rolled greedy scanner over UTF-8 codepoints (the project has no regex
+// engine with Unicode-property support, and std::regex cannot do \p{L}).
+std::vector<std::pair<std::size_t, std::size_t>> pretokenize(const std::string& s) {
+    std::vector<std::pair<std::size_t, std::size_t>> out;
+    const std::size_t n = s.size();
+    std::size_t i = 0;
+    while (i < n) {
+        uint32_t cp = 0;
+        const std::size_t len = utf8_next(s, i, cp);
+
+        // 1) contractions: ASCII apostrophe + a lowercase suffix.
+        if (cp == '\'') {
+            const char c1 = (i + 1 < n) ? s[i + 1] : 0;
+            const char c2 = (i + 2 < n) ? s[i + 2] : 0;
+            std::size_t clen = 0;
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd')
+                clen = 2;
+            else if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') ||
+                     (c1 == 'l' && c2 == 'l'))
+                clen = 3;
+            if (clen) {
+                out.emplace_back(i, i + clen);
+                i += clen;
+                continue;
+            }
+        }
+
+        // 2-4) ' ?\p{L}+' | ' ?\p{N}+' | ' ?[^\s\p{L}\p{N}]+': one optional leading
+        // literal space, then a maximal run of one character class.
+        const bool lead_space = (cp == ' ');
+        const std::size_t content = lead_space ? i + len : i;
+        if (content < n) {
+            uint32_t ccp = 0;
+            const std::size_t clen = utf8_next(s, content, ccp);
+            if (!is_space_cp(ccp)) {
+                const int cls = class_of(ccp);
+                std::size_t j = content + clen;
+                while (j < n) {
+                    uint32_t ncp = 0;
+                    const std::size_t nlen = utf8_next(s, j, ncp);
+                    if (is_space_cp(ncp) || class_of(ncp) != cls) break;
+                    j += nlen;
+                }
+                out.emplace_back(i, j);
+                i = j;
+                continue;
+            }
+        }
+
+        // 5-6) whitespace. Consume the maximal run; if it is followed by a
+        // non-space, leave its LAST codepoint for the next ' ?X+' to attach to
+        // (the effect of '\s+(?!\S)' sitting before ' ?\p{L}+').
+        std::size_t k = i;
+        std::size_t last = i;  // start of the final codepoint in the run
+        while (k < n) {
+            uint32_t wcp = 0;
+            const std::size_t wlen = utf8_next(s, k, wcp);
+            if (!is_space_cp(wcp)) break;
+            last = k;
+            k += wlen;
+        }
+        if (k < n && last > i) {
+            out.emplace_back(i, last);  // all but the last whitespace codepoint
+            i = last;
+        } else {
+            out.emplace_back(i, k);  // run reaches EOS, or is a single codepoint
+            i = k;
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 void Tokenizer::build_byte_maps() {
@@ -92,6 +212,10 @@ void Tokenizer::build_byte_maps() {
         byte_to_cp_[static_cast<std::size_t>(bs[i])] = static_cast<uint32_t>(cs[i]);
         cp_to_byte_[static_cast<uint32_t>(cs[i])] = static_cast<uint8_t>(bs[i]);
     }
+    // The encode side needs each byte's mapped symbol as a UTF-8 string.
+    for (int b = 0; b < 256; ++b)
+        byte_to_sym_[static_cast<std::size_t>(b)] =
+            utf8_encode(byte_to_cp_[static_cast<std::size_t>(b)]);
 }
 
 bool Tokenizer::load(const std::string& tokenizer_bin) {
@@ -151,15 +275,77 @@ bool Tokenizer::load(const std::string& tokenizer_bin) {
     }
 
     build_byte_maps();
+
+    // Encode-side lookups: vocab string -> id, and merge pair -> rank.
+    token_to_id_.clear();
+    token_to_id_.reserve(id_to_token_.size());
+    for (std::size_t i = 0; i < id_to_token_.size(); ++i)
+        token_to_id_.emplace(id_to_token_[i], static_cast<int>(i));
+    bpe_ranks_.clear();
+    for (std::size_t r = 0; r < merges_.size(); ++r)
+        bpe_ranks_.emplace(merges_[r], static_cast<int>(r));
+
     return true;
 }
 
+void Tokenizer::bpe(std::vector<std::string>& word) const {
+    while (word.size() >= 2) {
+        // Find the adjacent pair with the lowest merge rank.
+        int best_rank = INT_MAX;
+        std::string first, second;
+        bool found = false;
+        for (std::size_t j = 0; j + 1 < word.size(); ++j) {
+            const auto it = bpe_ranks_.find({word[j], word[j + 1]});
+            if (it != bpe_ranks_.end() && it->second < best_rank) {
+                best_rank = it->second;
+                first = word[j];
+                second = word[j + 1];
+                found = true;
+            }
+        }
+        if (!found) break;
+
+        // Merge every non-overlapping occurrence of that pair, left to right.
+        std::vector<std::string> merged;
+        merged.reserve(word.size());
+        std::size_t k = 0;
+        while (k < word.size()) {
+            if (k + 1 < word.size() && word[k] == first && word[k + 1] == second) {
+                merged.push_back(first + second);
+                k += 2;
+            } else {
+                merged.push_back(word[k]);
+                k += 1;
+            }
+        }
+        word.swap(merged);
+    }
+}
+
 std::vector<int> Tokenizer::encode(const std::string& text) const {
-    // TODO (Phase 2+): GPT-2 pre-tokenization regex, then the BPE merge loop
-    // over merges_ ranks. Until then, feed reference token ids directly.
-    (void)text;
-    std::fprintf(stderr, "[tokenizer] encode: not yet implemented (decode-first)\n");
-    return {};
+    if (sp_) {
+        std::fprintf(stderr, "[tokenizer] encode: SentencePiece (Llama) encode not implemented\n");
+        return {};
+    }
+    if (id_to_token_.empty()) return {};
+
+    std::vector<int> ids;
+    for (const auto& chunk : pretokenize(text)) {
+        // Map each byte of the chunk to its unicode-space symbol, then BPE-merge.
+        std::vector<std::string> word;
+        word.reserve(chunk.second - chunk.first);
+        for (std::size_t b = chunk.first; b < chunk.second; ++b)
+            word.push_back(byte_to_sym_[static_cast<unsigned char>(text[b])]);
+        bpe(word);
+        for (const std::string& sym : word) {
+            const auto it = token_to_id_.find(sym);
+            if (it != token_to_id_.end())
+                ids.push_back(it->second);
+            else
+                std::fprintf(stderr, "[tokenizer] encode: symbol not in vocab (skipped)\n");
+        }
+    }
+    return ids;
 }
 
 std::string Tokenizer::decode(const std::vector<int>& ids) const {
