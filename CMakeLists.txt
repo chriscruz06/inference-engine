@@ -119,4 +119,12 @@ if(IE_BUILD_TESTS)
     add_executable(test_kv_cache tests/test_kv_cache.cpp)
     target_link_libraries(test_kv_cache PRIVATE ie_core)
     add_test(NAME kv_cache_equivalence COMMAND test_kv_cache)
+
+    # GPT-2 BPE encoder. Hermetic by default: a tiny in-memory tokenizer drives
+    # decode/encode round-trips and a merge/boundary check (no real GPT-2 or
+    # Python). For the HuggingFace-parity check, run tests/make_encode_fixtures.py
+    # then `test_encode --tokenizer models/tokenizer.bin --fixtures <file>`.
+    add_executable(test_encode tests/test_encode.cpp)
+    target_link_libraries(test_encode PRIVATE ie_core)
+    add_test(NAME encode_equivalence COMMAND test_encode)
 endif()
