@@ -30,3 +30,10 @@ venv/
 .idea/
 .DS_Store
 *.swp
+
+# Claude Code local working dir
+.claude/
+# stray SentencePiece model (real ones live under models/)
+tokenizer.model
+# tokenizer/model fixtures tests write to the working dir
+ie_test_*.bin
