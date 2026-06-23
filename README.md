@@ -6,7 +6,7 @@
 
 `inference-engine` is a CPU language-model inference engine written in C++ with no machine-learning or math-library dependencies. It reads GPT-2 124M or TinyLlama 1.1B weights from disk, runs the full transformer forward pass directly, and generates text with greedy decoding and a KV cache. The standard library and, optionally, OpenMP are the only libraries linked. It provides a readable, framework-free implementation of transformer inference at the level of memory and arithmetic.
 
-> Status: the weight loader, the GPT-2 124M and TinyLlama 1.1B forward passes, KV-cached greedy generation, an AVX2-vectorized multithreaded GEMM, and weight-only int8/int4 quantization are implemented and tested. Both forward passes match their HuggingFace reference token-for-token on the reference prompt. The Llama port adds RMSNorm, rotary position embeddings, grouped-query attention, a SwiGLU MLP, and SentencePiece decoding; int8 quantization is near-lossless and speeds up decode on both models. The throughput comparison against llama.cpp is done: on the apples-to-apples fp32 path the engine is within 1.5x of llama.cpp on decode and 3.5x on prefill, on the same machine and thread count (full table below and in [BENCH.md](BENCH.md)). GPT-2 byte-level BPE encoding is implemented, so GPT-2 prompts can be passed as text with `--prompt`; SentencePiece (Llama) encoding is not, so Llama prompts are supplied as token ids.
+For the design rationale, the headline result, and the systems reasoning behind the numbers, see the project writeup in [`writeup.md`](writeup.md).
 
 ## Features
 
@@ -277,6 +277,7 @@ inference-engine/
 ├── CMakeLists.txt
 ├── Makefile
 ├── BENCH.md
+├── writeup.md
 └── .github/workflows/ci.yml
 ```
 

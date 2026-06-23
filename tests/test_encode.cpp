@@ -89,7 +89,9 @@ std::string utf8_encode(uint32_t cp) {
     return s;
 }
 
-std::string byte_sym(int b) { return utf8_encode(byte_to_cp(b)); }
+std::string byte_sym(int b) {
+    return utf8_encode(byte_to_cp(b));
+}
 
 void put_i32(std::ofstream& f, std::int32_t v) {
     f.write(reinterpret_cast<const char*>(&v), 4);
@@ -146,9 +148,10 @@ int run_hermetic() {
         "tabs\tand\nnewlines\r\nhere",
         "MixedCase 123 456 7th",
         "punctuation: (parens), [brackets]; \"quotes\" -- dashes!",
-        "ab hi abhi high",                       // exercises both merges
-        "caf\xC3\xA9 na\xC3\xAFve fa\xC3\xA7""ade",  // accented Latin (UTF-8)
-        "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E",  // CJK
+        "ab hi abhi high",  // exercises both merges
+        "caf\xC3\xA9 na\xC3\xAFve fa\xC3\xA7"
+        "ade",                                          // accented Latin (UTF-8)
+        "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E",         // CJK
         "emoji \xF0\x9F\x98\x80\xF0\x9F\x8E\x89 test",  // emoji (4-byte UTF-8)
     };
     for (const std::string& s : battery) check(rt(s), "decode(encode(s)) == s");
@@ -161,12 +164,10 @@ int run_hermetic() {
     // ...but never across a pretoken boundary: the space splits "a" | " b", so the
     // 'a'+'b' merge cannot reach across it. "a b" stays 'a', ' ', 'b' (3 tokens).
     check(static_cast<int>(tok.encode("a b").size()) == 3, "space blocks the 'a'+'b' merge");
-    check(tok.encode("a b").size() > tok.encode("ab").size(),
-          "boundary keeps the tokens separate");
+    check(tok.encode("a b").size() > tok.encode("ab").size(), "boundary keeps the tokens separate");
 
     if (g_failures == 0) {
-        std::printf("test_encode: OK (%zu round-trips + merge/boundary checks)\n",
-                    battery.size());
+        std::printf("test_encode: OK (%zu round-trips + merge/boundary checks)\n", battery.size());
         return 0;
     }
     std::fprintf(stderr, "test_encode: %d check(s) failed\n", g_failures);
@@ -181,10 +182,18 @@ std::string unescape(const std::string& s) {
         if (s[i] == '\\' && i + 1 < s.size()) {
             const char c = s[++i];
             switch (c) {
-                case 'n': o.push_back('\n'); break;
-                case 't': o.push_back('\t'); break;
-                case 'r': o.push_back('\r'); break;
-                case '\\': o.push_back('\\'); break;
+                case 'n':
+                    o.push_back('\n');
+                    break;
+                case 't':
+                    o.push_back('\t');
+                    break;
+                case 'r':
+                    o.push_back('\r');
+                    break;
+                case '\\':
+                    o.push_back('\\');
+                    break;
                 default:
                     o.push_back('\\');
                     o.push_back(c);
